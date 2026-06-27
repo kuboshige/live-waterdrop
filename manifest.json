@@ -1,0 +1,11 @@
+{
+  "name": "Rain on Glass · 雨粒",
+  "short_name": "雨粒",
+  "description": "フロントガラスの雨粒シミュレーション – 水滴が落ちて合体するライブ待ち受け",
+  "start_url": "/",
+  "display": "fullscreen",
+  "orientation": "portrait",
+  "background_color": "#070b14",
+  "theme_color": "#070b14",
+  "icons": []
+}

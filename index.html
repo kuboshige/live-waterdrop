@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#070b14">
+  <title>Rain on Glass · 雨粒</title>
+  <link rel="manifest" href="manifest.json">
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%; height: 100%;
+      overflow: hidden;
+      background: #070b14;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    canvas {
+      display: block;
+      width: 100%; height: 100%;
+      touch-action: none;
+    }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+let W = 0, H = 0;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Config
+// ──────────────────────────────────────────────────────────────────────────────
+const CFG = {
+  spawnProb:   0.10,   // chance per frame to spawn one rain impact
+  minR:        2.5,    // minimum spawn radius (px)
+  maxR:        8.0,    // maximum spawn radius (px)
+  fallThresh:  11,     // radius that triggers falling
+  gravity:     0.17,   // px/frame² (at 60fps)
+  maxFallSpd:  9,      // px/frame
+  maxDroplets: 200,
+  numStreaks:  28,
+  numBokeh:    45,
+};
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Background – pre-rendered to an offscreen canvas once per resize
+// ──────────────────────────────────────────────────────────────────────────────
+let bgCanvas;
+
+function buildBackground() {
+  bgCanvas = document.createElement('canvas');
+  bgCanvas.width  = W;
+  bgCanvas.height = H;
+  const bc = bgCanvas.getContext('2d');
+
+  // Night sky gradient
+  const sky = bc.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0,   '#060915');
+  sky.addColorStop(0.5, '#0c1828');
+  sky.addColorStop(1,   '#04080f');
+  bc.fillStyle = sky;
+  bc.fillRect(0, 0, W, H);
+
+  // Bokeh city lights seen through wet glass
+  const palette = [
+    [255, 210,  90],
+    [255, 165,  55],
+    [255, 240, 190],
+    [180, 220, 255],
+    [140, 205, 255],
+    [200, 255, 240],
+    [255, 110, 110],
+  ];
+  for (let i = 0; i < CFG.numBokeh; i++) {
+    const [r, g, b] = palette[Math.floor(Math.random() * palette.length)];
+    const x  = Math.random() * W;
+    const y  = Math.random() * H;
+    const sz = 6 + Math.random() * 44;
+    const a  = 0.04 + Math.random() * 0.10;
+    const gd = bc.createRadialGradient(x, y, 0, x, y, sz);
+    gd.addColorStop(0,    `rgba(${r},${g},${b},${Math.min(1, a * 2.6)})`);
+    gd.addColorStop(0.35, `rgba(${r},${g},${b},${a})`);
+    gd.addColorStop(1,    `rgba(${r},${g},${b},0)`);
+    bc.beginPath();
+    bc.arc(x, y, sz, 0, Math.PI * 2);
+    bc.fillStyle = gd;
+    bc.fill();
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Rain streaks – thin diagonal lines in the background
+// ──────────────────────────────────────────────────────────────────────────────
+const STREAK_ANGLE = Math.PI * 0.5 + 0.11;  // nearly vertical, slight slant
+const STREAK_CX    = Math.cos(STREAK_ANGLE);
+const STREAK_CY    = Math.sin(STREAK_ANGLE);
+
+class Streak {
+  constructor(init) { this.reset(init); }
+  reset(init) {
+    this.x     = Math.random() * (W + 40) - 20;
+    this.y     = init ? Math.random() * H : -35;
+    this.len   = 12 + Math.random() * 22;
+    this.spd   = 9 + Math.random() * 9;
+    this.alpha = 0.04 + Math.random() * 0.09;
+  }
+  update() {
+    this.x += STREAK_CX * this.spd;
+    this.y += STREAK_CY * this.spd;
+    if (this.y - this.len > H) this.reset(false);
+  }
+  draw() {
+    ctx.beginPath();
+    ctx.moveTo(this.x, this.y);
+    ctx.lineTo(this.x + STREAK_CX * this.len, this.y + STREAK_CY * this.len);
+    ctx.strokeStyle = `rgba(165,205,245,${this.alpha})`;
+    ctx.lineWidth   = 0.7;
+    ctx.stroke();
+  }
+}
+
+let streaks = [];
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Droplet
+// ──────────────────────────────────────────────────────────────────────────────
+class Droplet {
+  constructor(x, y, r) {
+    this.x = x; this.y = y; this.r = r;
+    this.vy      = 0;
+    this.vx      = (Math.random() - 0.5) * 0.4;
+    this.falling = false;
+    this.dead    = false;
+    this.bump    = 0;     // scale pulse applied on merge
+    this.trail   = [];    // [{x, y}] recorded while falling
+  }
+
+  get area() { return Math.PI * this.r * this.r; }
+
+  // Returns true when this droplet's circle overlaps with o's circle
+  overlaps(o) {
+    const dx = this.x - o.x, dy = this.y - o.y;
+    const rr = (this.r + o.r) * 0.94;
+    return dx * dx + dy * dy < rr * rr;
+  }
+
+  // Consume another droplet: conserve area, weighted-average position
+  absorb(o) {
+    const ta = this.area + o.area;
+    if (!this.falling) {
+      // Static droplet moves toward the absorbed one (weighted center of mass)
+      this.x = (this.x * this.area + o.x * o.area) / ta;
+      this.y = (this.y * this.area + o.y * o.area) / ta;
+    }
+    this.r    = Math.sqrt(ta / Math.PI);
+    this.bump = 0.16;
+    // Inherit some downward velocity from a falling victim
+    if (o.vy > this.vy) this.vy = o.vy * 0.55;
+    o.dead = true;
+  }
+
+  update(dt) {
+    // Decay the merge-bump animation
+    if (this.bump > 0) this.bump = Math.max(0, this.bump - 0.012 * dt);
+
+    // Threshold check: start falling when large enough
+    if (!this.falling && this.r >= CFG.fallThresh) {
+      this.falling = true;
+      this.vy = 0.9;
+    }
+
+    if (this.falling) {
+      this.vy  = Math.min(this.vy + CFG.gravity * dt, CFG.maxFallSpd);
+      this.y  += this.vy * dt;
+      this.x  += this.vx * dt;
+      this.vx *= Math.pow(0.97, dt);
+
+      // Record the top of the droplet as a trail point
+      this.trail.unshift({ x: this.x, y: this.y - this.r * 0.75 });
+      if (this.trail.length > 52) this.trail.pop();
+
+      if (this.y - this.r > H) this.dead = true;
+    }
+  }
+
+  draw() {
+    const s = 1 + Math.max(0, this.bump);
+    const r = this.r * s;
+
+    // ── Falling trail ──────────────────────────────────────────────────────
+    if (this.falling && this.trail.length > 2) {
+      const n    = this.trail.length;
+      const last = this.trail[n - 1];
+      const tg   = ctx.createLinearGradient(this.trail[0].x, this.trail[0].y, last.x, last.y);
+      tg.addColorStop(0, 'rgba(140,192,238,0.42)');
+      tg.addColorStop(1, 'rgba(140,192,238,0)');
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(this.trail[0].x, this.trail[0].y);
+      for (let i = 1; i < n; i++) ctx.lineTo(this.trail[i].x, this.trail[i].y);
+      ctx.strokeStyle = tg;
+      ctx.lineWidth   = Math.max(2, r * 0.30);
+      ctx.lineCap     = 'round';
+      ctx.lineJoin    = 'round';
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    ctx.save();
+    ctx.translate(this.x, this.y);
+
+    // Stretch the droplet vertically while it falls (teardrop feel)
+    if (this.falling && this.vy > 1.2) {
+      const st = Math.min(1.30, 1 + this.vy * 0.018);
+      ctx.scale(1 / Math.sqrt(st), Math.sqrt(st));
+    }
+
+    // ── Drop body ───────────────────────────────────────────────────────────
+    const bg = ctx.createRadialGradient(-r * 0.22, -r * 0.22, r * 0.04, r * 0.08, r * 0.08, r);
+    bg.addColorStop(0,    'rgba(222,244,255,0.92)');
+    bg.addColorStop(0.38, 'rgba(155,200,248,0.66)');
+    bg.addColorStop(0.82, 'rgba(90,150,220,0.38)');
+    bg.addColorStop(1,    'rgba(60,120,198,0.14)');
+
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
+    ctx.fillStyle = bg;
+    ctx.fill();
+
+    // ── Rim highlight ────────────────────────────────────────────────────────
+    ctx.strokeStyle = 'rgba(175,222,255,0.38)';
+    ctx.lineWidth   = 0.65;
+    ctx.stroke();
+
+    // ── Primary specular (upper-left bright spot) ────────────────────────────
+    const sp = ctx.createRadialGradient(-r * 0.30, -r * 0.38, 0, -r * 0.14, -r * 0.22, r * 0.55);
+    sp.addColorStop(0,    'rgba(255,255,255,0.96)');
+    sp.addColorStop(0.55, 'rgba(255,255,255,0.34)');
+    sp.addColorStop(1,    'rgba(255,255,255,0)');
+
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
+    ctx.fillStyle = sp;
+    ctx.fill();
+
+    // ── Secondary specular (lower-right, subtle) ─────────────────────────────
+    const sp2 = ctx.createRadialGradient(r * 0.32, r * 0.36, 0, r * 0.26, r * 0.30, r * 0.26);
+    sp2.addColorStop(0, 'rgba(210,238,255,0.44)');
+    sp2.addColorStop(1, 'rgba(210,238,255,0)');
+
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
+    ctx.fillStyle = sp2;
+    ctx.fill();
+
+    ctx.restore();
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Simulation
+// ──────────────────────────────────────────────────────────────────────────────
+let droplets = [];
+
+function spawnAt(x, y) {
+  if (droplets.length >= CFG.maxDroplets) return;
+  const r = CFG.minR + Math.random() * (CFG.maxR - CFG.minR);
+  droplets.push(new Droplet(x, y, r));
+}
+
+function randomSpawn() {
+  // Simulate a raindrop impact: place 1-3 tiny droplets in a tight cluster.
+  // Nearby drops overlap and merge, building up mass faster than isolated spawns.
+  const cx = CFG.maxR + Math.random() * (W - CFG.maxR * 2);
+  const cy = CFG.maxR + Math.random() * (H * 0.88 - CFG.maxR * 2);
+  const n  = Math.random() < 0.5 ? 1 : Math.random() < 0.7 ? 2 : 3;
+  for (let i = 0; i < n; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const dist  = Math.random() * 9;
+    spawnAt(cx + Math.cos(angle) * dist, cy + Math.sin(angle) * dist);
+  }
+}
+
+function processMerges() {
+  const n = droplets.length;
+  for (let i = 0; i < n; i++) {
+    if (droplets[i].dead) continue;
+    for (let j = i + 1; j < n; j++) {
+      if (droplets[j].dead) continue;
+      if (!droplets[i].overlaps(droplets[j])) continue;
+
+      const fi = droplets[i].falling;
+      const fj = droplets[j].falling;
+
+      if (fi && !fj) {
+        // Falling droplet absorbs static one (position unchanged)
+        droplets[i].absorb(droplets[j]);
+      } else if (!fi && fj) {
+        // Falling droplet absorbs static one
+        droplets[j].absorb(droplets[i]);
+      } else {
+        // Both static (or both falling): larger absorbs smaller
+        if (droplets[i].r >= droplets[j].r) droplets[i].absorb(droplets[j]);
+        else                                 droplets[j].absorb(droplets[i]);
+      }
+    }
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Render loop
+// ──────────────────────────────────────────────────────────────────────────────
+let lastTs = 0;
+
+function frame(ts) {
+  const dt = lastTs ? Math.min((ts - lastTs) / 16.667, 2.5) : 1;
+  lastTs = ts;
+
+  // Random spawn
+  if (droplets.length < CFG.maxDroplets && Math.random() < CFG.spawnProb * dt) {
+    randomSpawn();
+  }
+
+  // Physics
+  for (const d of droplets) d.update(dt);
+  processMerges();
+
+  // Remove dead droplets (in-place for no allocations)
+  let alive = 0;
+  for (let i = 0; i < droplets.length; i++) {
+    if (!droplets[i].dead) droplets[alive++] = droplets[i];
+  }
+  droplets.length = alive;
+
+  // ── Draw ─────────────────────────────────────────────────────────────────
+  ctx.drawImage(bgCanvas, 0, 0);
+
+  // Rain streaks
+  ctx.save();
+  for (const s of streaks) { s.update(); s.draw(); }
+  ctx.restore();
+
+  // Static droplets first so falling ones render on top
+  for (const d of droplets) if (!d.falling) d.draw();
+  for (const d of droplets) if ( d.falling) d.draw();
+
+  // Glass top-shine
+  const shine = ctx.createLinearGradient(0, 0, 0, H * 0.12);
+  shine.addColorStop(0, 'rgba(255,255,255,0.045)');
+  shine.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = shine;
+  ctx.fillRect(0, 0, W, H * 0.12);
+
+  // Vignette
+  const vg = ctx.createRadialGradient(W / 2, H / 2, H * 0.26, W / 2, H / 2, H * 0.74);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(0,0,0,0.50)');
+  ctx.fillStyle = vg;
+  ctx.fillRect(0, 0, W, H);
+
+  requestAnimationFrame(frame);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Touch / click: spawn a cluster of droplets at the tap point
+// ──────────────────────────────────────────────────────────────────────────────
+function onPointer(e) {
+  e.preventDefault();
+  const pts  = e.changedTouches ?? [e];
+  const rect = canvas.getBoundingClientRect();
+  const sx   = W / rect.width;
+  const sy   = H / rect.height;
+  for (const p of pts) {
+    const x = (p.clientX - rect.left) * sx;
+    const y = (p.clientY - rect.top)  * sy;
+    for (let i = 0; i < 5; i++) {
+      spawnAt(x + (Math.random() - 0.5) * 26, y + (Math.random() - 0.5) * 26);
+    }
+  }
+}
+canvas.addEventListener('touchstart', onPointer, { passive: false });
+canvas.addEventListener('mousedown',  onPointer);
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Init / Resize
+// ──────────────────────────────────────────────────────────────────────────────
+function init() {
+  W = canvas.width  = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+  buildBackground();
+  streaks  = Array.from({ length: CFG.numStreaks }, (_, i) => new Streak(true));
+  droplets = [];
+  // Pre-seed so the screen isn't empty on first frame
+  for (let i = 0; i < 35; i++) randomSpawn();
+}
+
+window.addEventListener('resize', () => {
+  W = canvas.width  = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+  buildBackground();
+  streaks = Array.from({ length: CFG.numStreaks }, (_, i) => new Streak(true));
+});
+
+init();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
