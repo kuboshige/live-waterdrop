@@ -78,14 +78,15 @@ const CFG = {
   maxR:         8.0,
   fallThresh:   11,
   gravity:      0.18,
-  maxSpeed:     10,
-  maxDroplets:  180,
+  maxSpeed:     12,
+  maxDroplets:  600,
   numStreaks:   18,
   refrMag:      1.65,
   trailDecay:   0.007,
   beadThresh:   1.6,
   beadProb:     0.12,
-  maxTrails:    16,
+  maxTrails:    20,
+  gridCell:     32,
 };
 
 // ── Default background ────────────────────────────────────────────────────────
@@ -142,25 +143,20 @@ class Trail {
     this.segs = pts.map(p => ({ x: p.x, y: p.y, w: p.w }));
     this.dead = false;
   }
-
   update(dt) {
-    const beads = [];
-    const alive = [];
+    const beads = [], alive = [];
     for (const s of this.segs) {
       s.w -= CFG.trailDecay * dt;
       if (s.w <= CFG.beadThresh) {
         if (Math.random() < CFG.beadProb)
           beads.push({ x: s.x + (Math.random() - 0.5) * 4, y: s.y,
                        r: 1.4 + Math.random() * 1.8 });
-      } else {
-        alive.push(s);
-      }
+      } else { alive.push(s); }
     }
     this.segs = alive;
     this.dead = this.segs.length === 0;
     return beads;
   }
-
   draw() {
     if (this.segs.length < 2) return;
     for (let i = 0; i < this.segs.length - 1; i++) {
@@ -172,14 +168,34 @@ class Trail {
       const alpha  = Math.min(0.52, (w - CFG.beadThresh) * 0.14);
       ctx.beginPath();
       ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
-      ctx.strokeStyle = bgReady
-        ? `rgba(220,235,248,${alpha})`
-        : `rgba(175,205,225,${alpha})`;
+      ctx.strokeStyle = bgReady ? `rgba(220,235,248,${alpha})` : `rgba(175,205,225,${alpha})`;
       ctx.lineWidth = w * 2 * wobble;
       ctx.lineCap  = 'round'; ctx.stroke();
     }
   }
 }
+
+// ── Spatial grid – O(n) collision detection ───────────────────────────────────────────
+class SpatialGrid {
+  constructor() { this.cells = new Map(); }
+  clear() { this.cells.clear(); }
+  insert(d, i) {
+    const k = `${Math.floor(d.x/CFG.gridCell)},${Math.floor(d.y/CFG.gridCell)}`;
+    let c = this.cells.get(k); if (!c) { c = []; this.cells.set(k, c); }
+    c.push(i);
+  }
+  neighbors(d) {
+    const cx = Math.floor(d.x/CFG.gridCell), cy = Math.floor(d.y/CFG.gridCell);
+    const out = [];
+    for (let dx = -1; dx <= 1; dx++)
+      for (let dy = -1; dy <= 1; dy++) {
+        const c = this.cells.get(`${cx+dx},${cy+dy}`);
+        if (c) for (const i of c) out.push(i);
+      }
+    return out;
+  }
+}
+const grid = new SpatialGrid();
 
 // ── Droplet ───────────────────────────────────────────────────────────────────
 class Droplet {
@@ -206,8 +222,10 @@ class Droplet {
     const v2 = o.r   * o.r   * o.r;
     const vt = v1 + v2;
     if (!this.falling) {
-      this.x = (this.x * v1 + o.x * v2) / vt;
-      this.y = (this.y * v1 + o.y * v2) / vt;
+      // r⁵ weighting: strongly biased toward the larger drop's position
+      const w1 = v1 * this.r * this.r, w2 = v2 * o.r * o.r, wt = w1 + w2;
+      this.x = (this.x * w1 + o.x * w2) / wt;
+      this.y = (this.y * w1 + o.y * w2) / wt;
     }
     this.r    = Math.cbrt(vt);
     this.ttl  = Infinity;
@@ -223,10 +241,12 @@ class Droplet {
     }
     if (this.bump > 0) this.bump = Math.max(0, this.bump - 0.012 * dt);
     if (!this.falling && this.r >= CFG.fallThresh) {
-      this.falling = true; this.vy = 0.9; this.lastTY = this.y;
+      this.falling = true; this.vy = 0; this.lastTY = this.y;
     }
     if (this.falling) {
-      this.vy  = Math.min(this.vy + CFG.gravity * dt, CFG.maxSpeed);
+      // Larger drops have higher terminal velocity (Stokes-like: v_max ∝ r)
+      const vMax = Math.min(CFG.maxSpeed, Math.max(0.4, this.r * 0.42 - 4.2));
+      this.vy  = Math.min(this.vy + CFG.gravity * dt, vMax);
       this.y  += this.vy * dt;
       this.phase += 0.065 * dt;
       this.vx   += Math.sin(this.phase) * 0.11 * dt;
@@ -254,9 +274,7 @@ class Droplet {
       const alpha  = Math.min(0.50, w * 0.14) * (0.25 + t * 0.75);
       ctx.beginPath();
       ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
-      ctx.strokeStyle = bgReady
-        ? `rgba(220,235,248,${alpha})`
-        : `rgba(175,205,225,${alpha})`;
+      ctx.strokeStyle = bgReady ? `rgba(220,235,248,${alpha})` : `rgba(175,205,225,${alpha})`;
       ctx.lineWidth = w * 2 * wobble;
       ctx.lineCap  = 'round'; ctx.stroke();
     }
@@ -267,11 +285,9 @@ class Droplet {
     const spd = this.falling ? Math.abs(this.vy) : 0;
     const sx  = this.falling ? 1 + Math.min(spd * 0.018, 0.32) : 1;
     const sy  = this.falling ? Math.max(0.68, 1 / (sx * 1.08))  : 1;
-    const rx  = r * sx;
-    const ry  = r * sy;
+    const rx  = r * sx, ry = r * sy;
 
-    if (this.falling && this.trailPts.length >= 2)
-      this._drawTrailLines(this.trailPts);
+    if (this.falling && this.trailPts.length >= 2) this._drawTrailLines(this.trailPts);
 
     if (r < 3.5) {
       ctx.beginPath();
@@ -285,11 +301,8 @@ class Droplet {
 
     ctx.save();
     ctx.beginPath();
-    if (this.falling) {
-      ctx.ellipse(this.x, this.y, rx, ry, 0, 0, Math.PI * 2);
-    } else {
-      ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
-    }
+    if (this.falling) ctx.ellipse(this.x, this.y, rx, ry, 0, 0, Math.PI * 2);
+    else              ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
     ctx.clip();
 
     if (bgReady && bgCvs) {
@@ -320,15 +333,11 @@ class Droplet {
     sp.addColorStop(1,    'rgba(255,255,255,0)');
     ctx.fillStyle = sp;
     ctx.fillRect(this.x - rx, this.y - ry, rx * 2, ry * 2);
-
     ctx.restore();
 
     ctx.beginPath();
-    if (this.falling) {
-      ctx.ellipse(this.x, this.y, rx, ry, 0, 0, Math.PI * 2);
-    } else {
-      ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
-    }
+    if (this.falling) ctx.ellipse(this.x, this.y, rx, ry, 0, 0, Math.PI * 2);
+    else              ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
     ctx.strokeStyle = 'rgba(0,12,28,0.42)';
     ctx.lineWidth   = Math.max(0.7, r * 0.055);
     ctx.stroke();
@@ -355,11 +364,13 @@ function randomSpawn() {
 }
 
 function processMerges() {
-  const n = droplets.length;
-  for (let i = 0; i < n; i++) {
+  grid.clear();
+  for (let i = 0; i < droplets.length; i++)
+    if (!droplets[i].dead) grid.insert(droplets[i], i);
+  for (let i = 0; i < droplets.length; i++) {
     if (droplets[i].dead) continue;
-    for (let j = i + 1; j < n; j++) {
-      if (droplets[j].dead) continue;
+    for (const j of grid.neighbors(droplets[i])) {
+      if (j <= i || droplets[j].dead) continue;
       if (!droplets[i].overlaps(droplets[j])) continue;
       const fi = droplets[i].falling, fj = droplets[j].falling;
       if      ( fi && !fj)                      droplets[i].absorb(droplets[j]);
@@ -388,9 +399,7 @@ function frame(ts) {
     if (d.dead) {
       if (d.falling && d.trailPts.length >= 4 && trails.length < CFG.maxTrails)
         trails.push(new Trail(d.trailPts));
-    } else {
-      alive.push(d);
-    }
+    } else { alive.push(d); }
   }
   droplets = alive;
 
