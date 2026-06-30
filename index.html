@@ -196,6 +196,9 @@ class Droplet {
     this.falling = false; this.dead = false; this.bump = 0;
     this.trailPts = [];   // [{x,y,w}] accumulated while falling
     this.lastTY   = y;
+    this.phase    = Math.random() * Math.PI * 2; // zigzag oscillator
+    // tiny beads (rebeaded from trails) evaporate so they don't clog maxDroplets
+    this.ttl = r < 5.0 ? 180 + Math.random() * 280 : Infinity;
   }
 
   get area() { return Math.PI * this.r * this.r; }
@@ -207,18 +210,28 @@ class Droplet {
   }
 
   absorb(o) {
-    const ta = this.area + o.area;
+    // hemisphere volume conservation: V = (2/3)πr³  →  r_new = ∛(r1³+r2³)
+    const v1 = this.r * this.r * this.r;
+    const v2 = o.r   * o.r   * o.r;
+    const vt = v1 + v2;
     if (!this.falling) {
-      this.x = (this.x * this.area + o.x * o.area) / ta;
-      this.y = (this.y * this.area + o.y * o.area) / ta;
+      this.x = (this.x * v1 + o.x * v2) / vt;
+      this.y = (this.y * v1 + o.y * v2) / vt;
     }
-    this.r    = Math.sqrt(ta / Math.PI);
+    this.r    = Math.cbrt(vt);
+    this.ttl  = Infinity; // grown drop no longer evaporates
     this.bump = 0.14;
     if (o.vy > this.vy) this.vy = o.vy * 0.5;
     o.dead = true;
   }
 
   update(dt) {
+    // tiny bead evaporation
+    if (this.ttl !== Infinity) {
+      this.ttl -= dt;
+      if (this.ttl <= 0) { this.dead = true; return; }
+    }
+
     if (this.bump > 0) this.bump = Math.max(0, this.bump - 0.012 * dt);
 
     if (!this.falling && this.r >= CFG.fallThresh) {
@@ -228,8 +241,11 @@ class Droplet {
     if (this.falling) {
       this.vy  = Math.min(this.vy + CFG.gravity * dt, CFG.maxSpeed);
       this.y  += this.vy * dt;
-      this.x  += this.vx * dt;
-      this.vx *= Math.pow(0.97, dt);
+      // zigzag: sinusoidal lateral oscillation (surface-tension resonance)
+      this.phase += 0.065 * dt;
+      this.vx   += Math.sin(this.phase) * 0.11 * dt;
+      this.x    += this.vx * dt;
+      this.vx   *= Math.pow(0.955, dt);
 
       // Record trail points every 3 px of vertical travel
       if (this.y - this.lastTY >= 3) {
@@ -268,6 +284,14 @@ class Droplet {
   draw() {
     const r = this.r * (1 + Math.max(0, this.bump));
 
+    // Aerodynamic deformation: falling speed → oblate (wider, shorter)
+    // Air pressure flattens the leading face; surface tension resists
+    const spd = this.falling ? Math.abs(this.vy) : 0;
+    const sx  = this.falling ? 1 + Math.min(spd * 0.018, 0.32) : 1; // horizontal stretch
+    const sy  = this.falling ? Math.max(0.68, 1 / (sx * 1.08))  : 1; // vertical squish
+    const rx  = r * sx;  // semi-axis x
+    const ry  = r * sy;  // semi-axis y
+
     // Draw live trail first (behind the droplet body)
     if (this.falling && this.trailPts.length >= 2)
       this._drawTrailLines(this.trailPts);
@@ -286,9 +310,13 @@ class Droplet {
     // ── Full-size droplet ──────────────────────────────────────────────────
     ctx.save();
 
-    // Clip circle
+    // Clip ellipse (or circle when static)
     ctx.beginPath();
-    ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
+    if (this.falling) {
+      ctx.ellipse(this.x, this.y, rx, ry, 0, 0, Math.PI * 2);
+    } else {
+      ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
+    }
     ctx.clip();
 
     // ── Refraction: flip + magnify background (convex water-lens effect) ───
@@ -305,28 +333,33 @@ class Droplet {
     }
 
     // ── Edge darkening (depth / total-internal-reflection rim) ─────────────
-    const eg = ctx.createRadialGradient(this.x, this.y, r * 0.52, this.x, this.y, r);
+    const rMax = Math.max(rx, ry);
+    const eg = ctx.createRadialGradient(this.x, this.y, rMax * 0.52, this.x, this.y, rMax);
     eg.addColorStop(0, 'rgba(0,0,0,0)');
     eg.addColorStop(1, 'rgba(0,0,0,0.28)');
     ctx.fillStyle = eg;
-    ctx.fillRect(this.x - r, this.y - r, r * 2, r * 2);
+    ctx.fillRect(this.x - rx, this.y - ry, rx * 2, ry * 2);
 
     // ── Specular crescent (upper-left highlight) ───────────────────────────
     const sp = ctx.createRadialGradient(
-      this.x - r * 0.30, this.y - r * 0.36, 0,
-      this.x - r * 0.08, this.y - r * 0.12, r * 0.60
+      this.x - rx * 0.30, this.y - ry * 0.36, 0,
+      this.x - rx * 0.08, this.y - ry * 0.12, rMax * 0.60
     );
     sp.addColorStop(0,    'rgba(255,255,255,0.72)');
     sp.addColorStop(0.38, 'rgba(255,255,255,0.20)');
     sp.addColorStop(1,    'rgba(255,255,255,0)');
     ctx.fillStyle = sp;
-    ctx.fillRect(this.x - r, this.y - r, r * 2, r * 2);
+    ctx.fillRect(this.x - rx, this.y - ry, rx * 2, ry * 2);
 
     ctx.restore(); // release clip
 
     // ── Dark ring border (characteristic of real drops on glass) ──────────
     ctx.beginPath();
-    ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
+    if (this.falling) {
+      ctx.ellipse(this.x, this.y, rx, ry, 0, 0, Math.PI * 2);
+    } else {
+      ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
+    }
     ctx.strokeStyle = 'rgba(0,12,28,0.42)';
     ctx.lineWidth   = Math.max(0.7, r * 0.055);
     ctx.stroke();
