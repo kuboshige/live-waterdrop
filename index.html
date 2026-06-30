@@ -73,19 +73,20 @@ canvas.addEventListener('drop', e => {
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const CFG = {
-  spawnProb:    0.10,   // per-frame spawn probability
+  spawnProb:    0.10,
   minR:         2.0,
   maxR:         8.0,
-  fallThresh:   11,     // radius that triggers falling
-  gravity:      0.18,   // px/frame² at 60fps
-  maxSpeed:     10,
-  maxDroplets:  180,
+  fallThresh:   11,
+  gravity:      0.18,
+  maxSpeed:     12,
+  maxDroplets:  600,    // raised; spatial grid keeps O(n) cost
   numStreaks:   18,
-  refrMag:      1.65,   // lens magnification (negative = flip)
-  trailDecay:   0.007,  // trail width decrease per frame
-  beadThresh:   1.6,    // trail width at which rebeading starts
-  beadProb:     0.12,   // probability per consumed segment of forming a bead
-  maxTrails:    16,
+  refrMag:      1.65,
+  trailDecay:   0.007,
+  beadThresh:   1.6,
+  beadProb:     0.12,
+  maxTrails:    20,
+  gridCell:     32,     // spatial grid cell size
 };
 
 // ── Default background ────────────────────────────────────────────────────────
@@ -188,6 +189,28 @@ class Trail {
   }
 }
 
+// ── Spatial grid – O(n) collision detection ───────────────────────────────────
+class SpatialGrid {
+  constructor() { this.cells = new Map(); }
+  clear() { this.cells.clear(); }
+  insert(d, i) {
+    const k = `${Math.floor(d.x/CFG.gridCell)},${Math.floor(d.y/CFG.gridCell)}`;
+    let c = this.cells.get(k); if (!c) { c = []; this.cells.set(k, c); }
+    c.push(i);
+  }
+  neighbors(d) {
+    const cx = Math.floor(d.x/CFG.gridCell), cy = Math.floor(d.y/CFG.gridCell);
+    const out = [];
+    for (let dx = -1; dx <= 1; dx++)
+      for (let dy = -1; dy <= 1; dy++) {
+        const c = this.cells.get(`${cx+dx},${cy+dy}`);
+        if (c) for (const i of c) out.push(i);
+      }
+    return out;
+  }
+}
+const grid = new SpatialGrid();
+
 // ── Droplet ───────────────────────────────────────────────────────────────────
 class Droplet {
   constructor(x, y, r) {
@@ -210,16 +233,19 @@ class Droplet {
   }
 
   absorb(o) {
-    // hemisphere volume conservation: V = (2/3)πr³  →  r_new = ∛(r1³+r2³)
     const v1 = this.r * this.r * this.r;
     const v2 = o.r   * o.r   * o.r;
     const vt = v1 + v2;
     if (!this.falling) {
-      this.x = (this.x * v1 + o.x * v2) / vt;
-      this.y = (this.y * v1 + o.y * v2) / vt;
+      // r⁵ weighting: strongly biased toward the larger drop's position
+      const w1 = v1 * this.r * this.r;
+      const w2 = v2 * o.r   * o.r;
+      const wt = w1 + w2;
+      this.x = (this.x * w1 + o.x * w2) / wt;
+      this.y = (this.y * w1 + o.y * w2) / wt;
     }
     this.r    = Math.cbrt(vt);
-    this.ttl  = Infinity; // grown drop no longer evaporates
+    this.ttl  = Infinity;
     this.bump = 0.14;
     if (o.vy > this.vy) this.vy = o.vy * 0.5;
     o.dead = true;
@@ -235,11 +261,13 @@ class Droplet {
     if (this.bump > 0) this.bump = Math.max(0, this.bump - 0.012 * dt);
 
     if (!this.falling && this.r >= CFG.fallThresh) {
-      this.falling = true; this.vy = 0.9; this.lastTY = this.y;
+      this.falling = true; this.vy = 0; this.lastTY = this.y;
     }
 
     if (this.falling) {
-      this.vy  = Math.min(this.vy + CFG.gravity * dt, CFG.maxSpeed);
+      // Larger drops have higher terminal velocity (Stokes-like: v_max ∝ r)
+      const vMax = Math.min(CFG.maxSpeed, Math.max(0.4, this.r * 0.42 - 4.2));
+      this.vy  = Math.min(this.vy + CFG.gravity * dt, vMax);
       this.y  += this.vy * dt;
       // zigzag: sinusoidal lateral oscillation (surface-tension resonance)
       this.phase += 0.065 * dt;
@@ -386,11 +414,13 @@ function randomSpawn() {
 }
 
 function processMerges() {
-  const n = droplets.length;
-  for (let i = 0; i < n; i++) {
+  grid.clear();
+  for (let i = 0; i < droplets.length; i++)
+    if (!droplets[i].dead) grid.insert(droplets[i], i);
+  for (let i = 0; i < droplets.length; i++) {
     if (droplets[i].dead) continue;
-    for (let j = i + 1; j < n; j++) {
-      if (droplets[j].dead) continue;
+    for (const j of grid.neighbors(droplets[i])) {
+      if (j <= i || droplets[j].dead) continue;
       if (!droplets[i].overlaps(droplets[j])) continue;
       const fi = droplets[i].falling, fj = droplets[j].falling;
       if      ( fi && !fj)                      droplets[i].absorb(droplets[j]);
