@@ -11,7 +11,8 @@
 <style>
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 html,body{width:100%;height:100%;overflow:hidden;background:#1a2430}
-#c{display:block;width:100%;height:100%;touch-action:none}
+#small,#c{display:block;position:absolute;top:0;left:0;width:100%;height:100%;touch-action:none}
+#small{pointer-events:none}
 #fileBtn{
   position:fixed;bottom:16px;right:16px;
   width:42px;height:42px;border-radius:21px;
@@ -25,16 +26,50 @@ html,body{width:100%;height:100%;overflow:hidden;background:#1a2430}
 </style>
 </head>
 <body>
+<svg style="position:absolute;width:0;height:0">
+  <defs>
+    <filter id="gooey" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="6" result="blur"/>
+      <feColorMatrix in="blur" mode="matrix"
+        values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 20 -7"/>
+    </filter>
+  </defs>
+</svg>
 <canvas id="c"></canvas>
+<canvas id="small"></canvas>
 <div id="fileBtn" title="背景を変更">🖼</div>
 <input id="fileIn" type="file" accept="image/*">
 <script>
 'use strict';
 
 // ── Canvas ────────────────────────────────────────────────────────────────────
-const canvas = document.getElementById('c');
-const ctx    = canvas.getContext('2d');
+const canvas    = document.getElementById('c');
+const ctx       = canvas.getContext('2d');
+const smallCvs  = document.getElementById('small');
+const smallCtx  = smallCvs.getContext('2d');
+const SMALL_R   = 6.5; // drops smaller than this go to untracked layer
+const gooCvs    = document.createElement('canvas'); // metaball silhouettes
+const gooCtx    = gooCvs.getContext('2d');
 let W = 0, H = 0;
+
+// Small-drop layer: fade each frame instead of clearing (ghosting effect)
+function fadeSmallLayer(dt) {
+  smallCtx.globalAlpha = Math.pow(0.965, dt);
+  smallCtx.globalCompositeOperation = 'destination-in';
+  smallCtx.fillRect(0, 0, W, H);
+  smallCtx.globalCompositeOperation = 'source-over';
+  smallCtx.globalAlpha = 1;
+}
+
+function drawSmallDrop(x, y, r) {
+  smallCtx.beginPath();
+  smallCtx.arc(x, y, r, 0, Math.PI * 2);
+  smallCtx.fillStyle = bgReady ? 'rgba(210,232,248,0.52)' : 'rgba(190,215,232,0.52)';
+  smallCtx.fill();
+  smallCtx.strokeStyle = 'rgba(20,45,70,0.28)';
+  smallCtx.lineWidth = 0.45;
+  smallCtx.stroke();
+}
 
 // ── Background ────────────────────────────────────────────────────────────────
 let bgImg = null, bgCvs = null, bgCtx2 = null, bgReady = false;
@@ -77,16 +112,16 @@ const CFG = {
   minR:         2.0,
   maxR:         8.0,
   fallThresh:   11,
-  gravity:      0.18,
-  maxSpeed:     12,
-  maxDroplets:  600,    // raised; spatial grid keeps O(n) cost
+  gravity:      0.20,
+  maxSpeed:     16,
+  maxDroplets:  600,
   numStreaks:   18,
   refrMag:      1.65,
   trailDecay:   0.007,
   beadThresh:   1.6,
   beadProb:     0.12,
   maxTrails:    20,
-  gridCell:     32,     // spatial grid cell size
+  gridCell:     32,
 };
 
 // ── Default background ────────────────────────────────────────────────────────
@@ -215,13 +250,19 @@ const grid = new SpatialGrid();
 class Droplet {
   constructor(x, y, r) {
     this.x = x; this.y = y; this.r = r;
-    this.vy = 0; this.vx = (Math.random() - 0.5) * 0.35;
+    this.vy = 0; this.vx = (Math.random() - 0.5) * 0.18;
     this.falling = false; this.dead = false; this.bump = 0;
-    this.trailPts = [];   // [{x,y,w}] accumulated while falling
+    this.trailPts = [];
     this.lastTY   = y;
-    this.phase    = Math.random() * Math.PI * 2; // zigzag oscillator
-    // tiny beads (rebeaded from trails) evaporate so they don't clog maxDroplets
     this.ttl = r < 5.0 ? 180 + Math.random() * 280 : Infinity;
+    // contact-line pinning: drop is pinned until r exceeds fallThresh + pinExtra
+    this.pinExtra  = 1.2 + Math.random() * 3.5; // random unpinning threshold
+    this.pinReleased = false;
+    // stick-slip state during fall
+    this.slipPhase = 0;   // cycles 0→slipPeriod; 0=stick, >half=slip
+    this.slipPeriod = 28 + Math.random() * 22;
+    // tap-vibration nudge
+    this.vibTimer  = 0;
   }
 
   get area() { return Math.PI * this.r * this.r; }
@@ -259,21 +300,32 @@ class Droplet {
     }
 
     if (this.bump > 0) this.bump = Math.max(0, this.bump - 0.012 * dt);
+    if (this.vibTimer > 0) this.vibTimer = Math.max(0, this.vibTimer - dt);
 
-    if (!this.falling && this.r >= CFG.fallThresh) {
-      this.falling = true; this.vy = 0; this.lastTY = this.y;
+    // Contact-line pinning: drop doesn't fall until r exceeds fallThresh + pinExtra
+    if (!this.falling && this.r >= CFG.fallThresh + this.pinExtra) {
+      this.falling = true;
+      this.pinReleased = true;
+      this.vy = 0.6 + Math.random() * 0.4; // release jerk
+      this.lastTY = this.y;
+      this.slipPhase = this.slipPeriod * 0.55; // start mid-slip
     }
 
     if (this.falling) {
-      // Larger drops have higher terminal velocity (Stokes-like: v_max ∝ r)
-      const vMax = Math.min(CFG.maxSpeed, Math.max(0.4, this.r * 0.42 - 4.2));
-      this.vy  = Math.min(this.vy + CFG.gravity * dt, vMax);
+      // Stokes-like: terminal velocity ∝ r² (larger drops accelerate much faster)
+      const rn   = (this.r - CFG.fallThresh) / CFG.fallThresh;
+      const vMax = Math.min(CFG.maxSpeed, 0.5 + rn * rn * 14 + rn * 2);
+
+      // Stick-slip: alternate between deceleration (stick) and free-fall (slip)
+      this.slipPhase = (this.slipPhase + dt) % this.slipPeriod;
+      const sticking = this.slipPhase < this.slipPeriod * 0.38;
+      const gravMul  = sticking ? 0.08 : 1.0; // nearly halted during stick
+      const drag     = sticking ? Math.pow(0.78, dt) : 1.0;
+
+      this.vy  = Math.min(this.vy * drag + CFG.gravity * gravMul * dt, vMax);
       this.y  += this.vy * dt;
-      // zigzag: sinusoidal lateral oscillation (surface-tension resonance)
-      this.phase += 0.065 * dt;
-      this.vx   += Math.sin(this.phase) * 0.11 * dt;
-      this.x    += this.vx * dt;
-      this.vx   *= Math.pow(0.955, dt);
+      this.x  += this.vx * dt;
+      this.vx *= Math.pow(0.92, dt);
 
       // Record trail points every 3 px of vertical travel
       if (this.y - this.lastTY >= 3) {
@@ -312,13 +364,15 @@ class Droplet {
   draw() {
     const r = this.r * (1 + Math.max(0, this.bump));
 
-    // Aerodynamic deformation: falling speed → oblate (wider, shorter)
-    // Air pressure flattens the leading face; surface tension resists
+    // Aerodynamic deformation: speed → oblate ellipse (wider than tall)
+    // Weber number analogy: deformation ∝ v² at high speed
     const spd = this.falling ? Math.abs(this.vy) : 0;
-    const sx  = this.falling ? 1 + Math.min(spd * 0.018, 0.32) : 1; // horizontal stretch
-    const sy  = this.falling ? Math.max(0.68, 1 / (sx * 1.08))  : 1; // vertical squish
-    const rx  = r * sx;  // semi-axis x
-    const ry  = r * sy;  // semi-axis y
+    const t   = Math.min(1, spd / CFG.maxSpeed);          // 0..1 normalized speed
+    const sxRaw = 1 + t * t * 0.55;                       // up to 1.55× wide
+    const sx  = this.falling ? sxRaw : 1;
+    const sy  = this.falling ? Math.max(0.58, 1 / (sx * 1.12)) : 1;
+    const rx  = r * sx;
+    const ry  = r * sy;
 
     // Draw live trail first (behind the droplet body)
     if (this.falling && this.trailPts.length >= 2)
@@ -398,8 +452,13 @@ class Droplet {
 let droplets = [], trails = [];
 
 function spawnAt(x, y, r) {
-  if (droplets.length >= CFG.maxDroplets) return;
   r = r ?? (CFG.minR + Math.random() * (CFG.maxR - CFG.minR));
+  if (r < SMALL_R) {
+    // Small drops: draw directly to untracked layer, no object created
+    drawSmallDrop(x, y, r);
+    return;
+  }
+  if (droplets.length >= CFG.maxDroplets) return;
   droplets.push(new Droplet(x, y, r));
 }
 
@@ -466,12 +525,30 @@ function frame(ts) {
   trails = aliveT;
 
   // ── Render ───────────────────────────────────────────────────────────────
+  fadeSmallLayer(dt);
   drawBg();
 
   for (const s of streaks) { s.update(); s.draw(); }
   for (const t of trails)   t.draw();
 
-  // Static droplets first, falling on top
+  // Metaball gooey layer: organic blob silhouettes for all tracked drops
+  gooCtx.clearRect(0, 0, W, H);
+  for (const d of droplets) {
+    if (d.dead) continue;
+    const spd = d.falling ? Math.abs(d.vy) : 0;
+    const tn  = Math.min(1, spd / CFG.maxSpeed);
+    const sx  = d.falling ? 1 + tn * tn * 0.55 : 1;
+    const sy  = d.falling ? Math.max(0.58, 1 / (sx * 1.12)) : 1;
+    gooCtx.beginPath();
+    gooCtx.ellipse(d.x, d.y, d.r * sx + 0.8, d.r * sy + 0.8, 0, 0, Math.PI * 2);
+    gooCtx.fillStyle = bgReady ? 'rgba(165,210,240,0.88)' : 'rgba(175,210,235,0.88)';
+    gooCtx.fill();
+  }
+  ctx.filter = 'url(#gooey)';
+  ctx.drawImage(gooCvs, 0, 0);
+  ctx.filter = 'none';
+
+  // Drop detail on top: refraction, specular, borders
   for (const d of droplets) if (!d.falling) d.draw();
   for (const d of droplets) if ( d.falling) d.draw();
 
@@ -496,21 +573,39 @@ function onPointer(e) {
   e.preventDefault();
   const pts  = e.changedTouches ?? [e];
   const rect = canvas.getBoundingClientRect();
-  const sx = W / rect.width, sy = H / rect.height;
+  const scx = W / rect.width, scy = H / rect.height;
   for (const p of pts) {
-    const x = (p.clientX - rect.left) * sx;
-    const y = (p.clientY - rect.top)  * sy;
-    for (let i = 0; i < 5; i++)
-      spawnAt(x + (Math.random() - 0.5) * 22, y + (Math.random() - 0.5) * 22);
+    const px = (p.clientX - rect.left) * scx;
+    const py = (p.clientY - rect.top)  * scy;
+
+    // Tap vibration: near-threshold static drops nudge downward
+    const vibrThresh = CFG.fallThresh * 0.72;
+    for (const d of droplets) {
+      if (d.falling || d.r < vibrThresh) continue;
+      // vibration strength scales with how close the drop is to threshold
+      const ratio  = (d.r - vibrThresh) / (CFG.fallThresh - vibrThresh + d.pinExtra);
+      const nudge  = ratio * d.r * 0.55;
+      d.y         += nudge;
+      d.bump       = Math.max(d.bump, 0.08 + ratio * 0.1);
+      d.vibTimer   = 8;
+    }
+
+    // Also spawn a few new drops at tap location
+    for (let i = 0; i < 4; i++)
+      spawnAt(px + (Math.random() - 0.5) * 20, py + (Math.random() - 0.5) * 20);
   }
 }
 canvas.addEventListener('touchstart', onPointer, { passive: false });
 canvas.addEventListener('mousedown',  onPointer);
 
 // ── Resize / Init ─────────────────────────────────────────────────────────────
+function resizeCanvases() {
+  W = canvas.width  = smallCvs.width  = gooCvs.width  = window.innerWidth;
+  H = canvas.height = smallCvs.height = gooCvs.height = window.innerHeight;
+}
+
 function init() {
-  W = canvas.width  = window.innerWidth;
-  H = canvas.height = window.innerHeight;
+  resizeCanvases();
   updateBgCvs();
   streaks  = Array.from({ length: CFG.numStreaks }, () => new Streak(true));
   droplets = []; trails = [];
@@ -518,8 +613,7 @@ function init() {
 }
 
 window.addEventListener('resize', () => {
-  W = canvas.width  = window.innerWidth;
-  H = canvas.height = window.innerHeight;
+  resizeCanvases();
   updateBgCvs();
   streaks = Array.from({ length: CFG.numStreaks }, () => new Streak(true));
 });
