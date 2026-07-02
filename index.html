@@ -158,6 +158,7 @@ const CFG = {
   beadThresh:     1.3,
   beadProb:       0.20,
   maxTrails:      24,
+  trailConsumeSpeed: 3.5,
   gridCell:       28,
   depositSpeedMin:2.8,
   depositInterval:4,
@@ -215,24 +216,52 @@ class Trail {
   constructor(pts) {
     this.segs = pts.map(p => ({ x: p.x, y: p.y, w: p.w }));
     this.dead = false;
+    this.consumed = 0; // px consumed from the top (oldest) end
   }
   update(dt) {
-    const beads = [], alive = [];
-    for (const s of this.segs) {
-      s.w -= CFG.trailDecay * dt;
-      if (s.w <= CFG.beadThresh) {
-        if (Math.random() < CFG.beadProb)
-          beads.push({ x: s.x + (Math.random() - 0.5) * 3, y: s.y,
-                       r: 1.0 + Math.random() * 1.6 });
-      } else {
-        alive.push(s);
-      }
+    const beads = [];
+    this.consumed += CFG.trailConsumeSpeed * dt;
+    // Each recorded segment is ~4px apart; remove whole segments as consumed advances
+    const segPx = 4;
+    const removeCount = Math.floor(this.consumed / segPx);
+    for (let i = 0; i < Math.min(removeCount, this.segs.length); i++) {
+      if (Math.random() < CFG.beadProb)
+        beads.push({ x: this.segs[i].x + (Math.random() - 0.5) * 4, y: this.segs[i].y,
+                     r: 0.7 + Math.random() * 1.5 });
     }
-    this.segs = alive;
-    this.dead = this.segs.length === 0;
+    if (removeCount > 0) {
+      this.segs.splice(0, Math.min(removeCount, this.segs.length));
+      this.consumed -= removeCount * segPx;
+    }
+    this.dead = this.segs.length < 2;
     return beads;
   }
-  draw() { /* 水あと線を描画しない — リビーズのみ機能させる */ }
+  draw() {
+    if (this.segs.length < 2) return;
+    ctx.save();
+    // Trail width based on the drop radius stored in w (w = r * 0.28)
+    const w = this.segs[this.segs.length - 1].w;
+    const trailW = Math.max(3, w * 3.8);
+    const buildPath = () => {
+      ctx.beginPath();
+      ctx.moveTo(this.segs[0].x, this.segs[0].y);
+      for (let i = 1; i < this.segs.length; i++)
+        ctx.lineTo(this.segs[i].x, this.segs[i].y);
+    };
+    // Dome body — wide base (the sides of the kamaboko ridge)
+    buildPath();
+    ctx.lineWidth = trailW;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = bgReady ? 'rgba(190,218,238,0.52)' : 'rgba(170,205,228,0.52)';
+    ctx.stroke();
+    // Dome highlight — narrow bright stripe down the crown
+    buildPath();
+    ctx.lineWidth = trailW * 0.38;
+    ctx.strokeStyle = 'rgba(235,250,255,0.72)';
+    ctx.stroke();
+    ctx.restore();
+  }
 }
 
 // ── Spatial grid ──────────────────────────────────────────────────────────────
