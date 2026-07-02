@@ -68,7 +68,7 @@ input[type=range]{width:100%;cursor:pointer;accent-color:#5aaed4}
     <input type="range" id="maxRSlider" min="3.0" max="12.0" step="0.5" value="6.0">
   </div>
   <div class="srow">
-    <div class="slabel">降雨強度<span id="spawnVal">中雨</span></div>
+    <div class="slabel">降雨強度<span id="spawnVal">中</span></div>
     <input type="range" id="spawnSlider" min="1" max="5" step="1" value="3">
   </div>
 </div>
@@ -81,9 +81,10 @@ const canvas   = document.getElementById('c');
 const ctx      = canvas.getContext('2d');
 const smallCvs = document.getElementById('small');
 const smallCtx = smallCvs.getContext('2d');
-const SMALL_R  = 5.5;
+const SMALL_R  = 5.5;  // tracked threshold
 let W = 0, H = 0;
 
+// Small-drop layer fades each frame
 function fadeSmallLayer(dt) {
   smallCtx.globalAlpha = Math.pow(0.968, dt);
   smallCtx.globalCompositeOperation = 'destination-in';
@@ -140,6 +141,9 @@ canvas.addEventListener('drop', e => {
 });
 
 // ── Config ────────────────────────────────────────────────────────────────────
+// Real raindrop stats: drizzle r≈0.05-0.3mm, light r≈0.3-1mm, mod r≈1-1.5mm
+// On ~70mm-wide phone screen ≈ 5.6px/mm → r≈1.7-5.6px for typical raindrops
+// Live-wallpaper aesthetic: bias toward small, occasional large for drama
 const CFG = {
   spawnProb:      0.12,
   minR:           1.0,
@@ -155,8 +159,8 @@ const CFG = {
   beadProb:       0.20,
   maxTrails:      24,
   gridCell:       28,
-  depositSpeedMin:3.5,
-  depositInterval:6,
+  depositSpeedMin:2.8,
+  depositInterval:4,
 };
 
 // ── Default background ────────────────────────────────────────────────────────
@@ -206,7 +210,7 @@ class Streak {
 }
 let streaks = [];
 
-// ── Trail ─────────────────────────────────────────────────────────────────────
+// ── Trail (water mark that beads up after drop exits) ─────────────────────────
 class Trail {
   constructor(pts) {
     this.segs = pts.map(p => ({ x: p.x, y: p.y, w: p.w }));
@@ -228,25 +232,7 @@ class Trail {
     this.dead = this.segs.length === 0;
     return beads;
   }
-  draw() {
-    if (this.segs.length < 2) return;
-    for (let i = 0; i < this.segs.length - 1; i++) {
-      const a = this.segs[i], b = this.segs[i + 1];
-      const dx = b.x - a.x, dy = b.y - a.y;
-      if (dx * dx + dy * dy > 400) continue;
-      const w      = (a.w + b.w) * 0.5;
-      const wobble = 1 + 0.14 * Math.sin(a.y * 0.55);
-      const alpha  = Math.min(0.15, (w - CFG.beadThresh) * 0.035);
-      if (alpha <= 0) continue;
-      ctx.beginPath();
-      ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
-      ctx.strokeStyle = bgReady
-        ? `rgba(200,222,240,${alpha})`
-        : `rgba(160,192,215,${alpha})`;
-      ctx.lineWidth = w * 1.6 * wobble;
-      ctx.lineCap  = 'round'; ctx.stroke();
-    }
-  }
+  draw() { /* 水あと線を描画しない — リビーズのみ機能させる */ }
 }
 
 // ── Spatial grid ──────────────────────────────────────────────────────────────
@@ -277,25 +263,39 @@ class Droplet {
     this.x = x; this.y = y; this.r = r;
     this.vy = 0; this.vx = (Math.random() - 0.5) * 0.15;
     this.falling = false; this.dead = false; this.bump = 0;
-    this.trailPts     = [];
-    this.lastTY       = y;
+    this.trailPts    = [];
+    this.lastTY      = y;
     this.lastDepositY = y;
-    this.impact    = 0.75;
-    this.ttl       = r < 3.5 ? 150 + Math.random() * 260 : Infinity;
+    // Spawn impact spread: briefly larger collision radius so nearby drops merge
+    this.impact = 0.75;
+    // TTL for tiny beads
+    this.ttl = r < 3.5 ? 150 + Math.random() * 260 : Infinity;
+    // Contact-line pinning: narrower random range for hydrophobic surface
     this.pinExtra  = 0.6 + Math.random() * 2.2;
     this.pinReleased = false;
-    this.slipPhase   = 0;
-    this.slipPeriod  = 20 + Math.random() * 18;
-    this.vibTimer    = 0;
+    // Stick-slip
+    this.slipPhase  = 0;
+    this.slipPeriod = 20 + Math.random() * 18;
+    this.vibTimer   = 0;
   }
 
   get area() { return Math.PI * this.r * this.r; }
 
   overlaps(o) {
-    const dx  = this.x - o.x, dy = this.y - o.y;
-    const myR = this.r * (1 + this.impact * 0.50);
-    const oR  = o.r   * (1 + o.impact   * 0.50);
-    const rr  = (myR + oR) * 0.92;
+    const dx = this.x - o.x, dy = this.y - o.y;
+    // Effective radius = max semi-axis of the ellipse (horizontal for oblate drops)
+    // falling: oblate deformation; impact: spreading on landing; static: circle
+    const myTn  = this.falling ? Math.min(1, Math.abs(this.vy) / CFG.maxSpeed) : 0;
+    const mySx  = this.falling ? 1 + myTn * myTn * 0.55
+                : this.impact > 0 ? 1 + this.impact * 0.22 : 1;
+    const myEff = this.r * mySx * (1 + this.impact * 0.45);
+
+    const oTn   = o.falling ? Math.min(1, Math.abs(o.vy) / CFG.maxSpeed) : 0;
+    const oSx   = o.falling ? 1 + oTn * oTn * 0.55
+                : o.impact > 0 ? 1 + o.impact * 0.22 : 1;
+    const oEff  = o.r * oSx * (1 + o.impact * 0.45);
+
+    const rr = (myEff + oEff) * 0.88;
     return dx * dx + dy * dy < rr * rr;
   }
 
@@ -325,19 +325,22 @@ class Droplet {
     if (this.bump     > 0) this.bump     = Math.max(0, this.bump     - 0.012 * dt);
     if (this.vibTimer > 0) this.vibTimer = Math.max(0, this.vibTimer - dt);
 
+    // Contact-line pinning release
     if (!this.falling && this.r >= CFG.fallThresh + this.pinExtra) {
-      this.falling      = true;
-      this.pinReleased  = true;
-      this.vy           = 0.8 + Math.random() * 0.7;
-      this.lastTY       = this.y;
+      this.falling     = true;
+      this.pinReleased = true;
+      this.vy          = 0.8 + Math.random() * 0.7; // release jerk
+      this.lastTY      = this.y;
       this.lastDepositY = this.y;
-      this.slipPhase    = this.slipPeriod * 0.6;
+      this.slipPhase   = this.slipPeriod * 0.6;
     }
 
     if (this.falling) {
       const excess = this.r - CFG.fallThresh;
-      const vMax   = Math.min(CFG.maxSpeed, Math.max(1.5, excess * excess * 0.10 + excess * 0.40));
+      // Quadratic speed scaling — large drops accelerate dramatically
+      const vMax = Math.min(CFG.maxSpeed, Math.max(1.5, excess * excess * 0.10 + excess * 0.40));
 
+      // Stick-slip: larger drops have much less sticking (hydrophobic surface)
       this.slipPhase = (this.slipPhase + dt) % this.slipPeriod;
       const slipRatio = Math.max(0.06, 0.24 - excess * 0.014);
       const sticking  = this.slipPhase < this.slipPeriod * slipRatio;
@@ -349,6 +352,7 @@ class Droplet {
       this.x  += this.vx * dt;
       this.vx *= Math.pow(0.93, dt);
 
+      // Deposit tiny drops along path when falling fast (trail of beads)
       if (this.vy > CFG.depositSpeedMin) {
         const dist = this.y - this.lastDepositY;
         if (dist >= CFG.depositInterval) {
@@ -364,6 +368,7 @@ class Droplet {
         this.lastDepositY = this.y;
       }
 
+      // Record path for post-exit Trail (rebeading)
       if (this.y - this.lastTY >= 4) {
         this.trailPts.push({ x: this.x, y: this.lastTY + 2, w: this.r * 0.28 });
         this.lastTY = this.y;
@@ -378,6 +383,7 @@ class Droplet {
     const impRad = 1 + Math.max(0, this.impact * 0.28);
     const r = this.r * (1 + Math.max(0, this.bump)) * impRad;
 
+    // Oblate deformation: speed-based (and gentle spread during impact)
     const spd = this.falling ? Math.abs(this.vy) : 0;
     const tn  = Math.min(1, spd / CFG.maxSpeed);
     let sx = 1, sy = 1;
@@ -385,10 +391,13 @@ class Droplet {
       sx = 1 + tn * tn * 0.55;
       sy = Math.max(0.58, 1 / (sx * 1.12));
     } else if (this.impact > 0) {
+      // Spreading on impact: briefly wider/flatter
       sx = 1 + this.impact * 0.22;
       sy = Math.max(0.78, 1 / (sx * 1.06));
     }
     const rx = r * sx, ry = r * sy;
+
+    // No live trail lines drawn here — fast drops deposit via drawSmallDrop
 
     if (r < 3.2) {
       ctx.beginPath();
@@ -408,6 +417,7 @@ class Droplet {
     else           ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
     ctx.clip();
 
+    // Refraction
     if (bgReady && bgCvs) {
       ctx.save();
       ctx.translate(this.x, this.y);
@@ -420,6 +430,7 @@ class Droplet {
       ctx.fillRect(this.x - rx, this.y - ry, rx * 2, ry * 2);
     }
 
+    // Edge darkening
     const rMax = Math.max(rx, ry);
     const eg = ctx.createRadialGradient(this.x, this.y, rMax * 0.50, this.x, this.y, rMax);
     eg.addColorStop(0, 'rgba(0,0,0,0)');
@@ -427,6 +438,7 @@ class Droplet {
     ctx.fillStyle = eg;
     ctx.fillRect(this.x - rx, this.y - ry, rx * 2, ry * 2);
 
+    // Specular crescent
     const sp = ctx.createRadialGradient(
       this.x - rx * 0.28, this.y - ry * 0.34, 0,
       this.x - rx * 0.07, this.y - ry * 0.10, rMax * 0.58
@@ -439,6 +451,7 @@ class Droplet {
 
     ctx.restore();
 
+    // Dark ring border
     ctx.beginPath();
     if (isEllipse) ctx.ellipse(this.x, this.y, rx, ry, 0, 0, Math.PI * 2);
     else           ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
@@ -453,17 +466,21 @@ let droplets = [], trails = [];
 
 function spawnAt(x, y, r) {
   if (r === undefined) {
+    // Power-law bias toward smaller drops (matches real rain drop size distribution)
     const rnd = Math.pow(Math.random(), 2.4);
     r = CFG.minR + rnd * (CFG.maxR - CFG.minR);
   }
-  if (r < SMALL_R) { drawSmallDrop(x, y, r); return; }
+  if (r < SMALL_R) {
+    drawSmallDrop(x, y, r);
+    return;
+  }
   if (droplets.length >= CFG.maxDroplets) return;
   droplets.push(new Droplet(x, y, r));
 }
 
 function randomSpawn() {
   const cx = CFG.maxR + Math.random() * (W - CFG.maxR * 2);
-  const cy = CFG.maxR + Math.random() * (H * 0.88 - CFG.maxR * 2);
+  const cy = CFG.maxR + Math.random() * (H - CFG.maxR * 2); // 画面全体
   const n  = Math.random() < 0.58 ? 1 : Math.random() < 0.68 ? 2 : 3;
   for (let i = 0; i < n; i++) {
     const a = Math.random() * Math.PI * 2, d = Math.random() * 6;
@@ -502,6 +519,7 @@ function frame(ts) {
   for (const d of droplets) d.update(dt);
   processMerges();
 
+  // Cull dead; harvest trails
   const alive = [];
   for (const d of droplets) {
     if (d.dead) {
@@ -513,6 +531,7 @@ function frame(ts) {
   }
   droplets = alive;
 
+  // Update trails; rebeading
   const aliveT = [];
   for (const t of trails) {
     const beads = t.update(dt);
@@ -521,6 +540,7 @@ function frame(ts) {
   }
   trails = aliveT;
 
+  // ── Render ───────────────────────────────────────────────────────────────
   fadeSmallLayer(dt);
   drawBg();
 
@@ -530,11 +550,13 @@ function frame(ts) {
   for (const d of droplets) if (!d.falling) d.draw();
   for (const d of droplets) if ( d.falling) d.draw();
 
+  // Glass top-shine
   const shine = ctx.createLinearGradient(0, 0, 0, H * 0.07);
   shine.addColorStop(0, 'rgba(255,255,255,0.052)');
   shine.addColorStop(1, 'rgba(255,255,255,0)');
   ctx.fillStyle = shine; ctx.fillRect(0, 0, W, H * 0.07);
 
+  // Vignette
   const vg = ctx.createRadialGradient(W/2, H/2, H * 0.28, W/2, H/2, H * 0.75);
   vg.addColorStop(0, 'rgba(0,0,0,0)');
   vg.addColorStop(1, 'rgba(0,0,0,0.30)');
@@ -551,17 +573,20 @@ let settingsTimer   = null;
 function showSettingsBtn() {
   settingsBtn.classList.add('vis');
   clearTimeout(settingsTimer);
-  if (!settingsPanel.classList.contains('vis'))
+  if (!settingsPanel.classList.contains('vis')) {
     settingsTimer = setTimeout(() => settingsBtn.classList.remove('vis'), 2800);
+  }
 }
 
 settingsBtn.addEventListener('click', () => {
   settingsPanel.classList.toggle('vis');
   clearTimeout(settingsTimer);
-  if (!settingsPanel.classList.contains('vis'))
+  if (!settingsPanel.classList.contains('vis')) {
     settingsTimer = setTimeout(() => settingsBtn.classList.remove('vis'), 2000);
+  }
 });
 
+// Close settings when tapping main canvas
 canvas.addEventListener('touchstart', () => {
   if (settingsPanel.classList.contains('vis')) {
     settingsPanel.classList.remove('vis');
@@ -570,7 +595,7 @@ canvas.addEventListener('touchstart', () => {
 }, { passive: true });
 
 const spawnLabels = ['霧雨', '小雨', '中雨', '大雨', '豪雨'];
-const spawnProbs  = [0.04, 0.07, 0.12, 0.20, 0.32];
+const spawnProbs  = [0.08, 0.16, 0.32, 0.55, 0.90]; // 旧maxを中央(中雨)に
 
 document.getElementById('minRSlider').addEventListener('input', e => {
   CFG.minR = parseFloat(e.target.value);
@@ -598,6 +623,7 @@ function onPointer(e) {
     const px = (p.clientX - rect.left) * scx;
     const py = (p.clientY - rect.top)  * scy;
 
+    // Tap vibration: near-threshold drops nudge downward
     const vibrThresh = CFG.fallThresh * 0.72;
     for (const d of droplets) {
       if (d.falling || d.r < vibrThresh) continue;
@@ -607,17 +633,22 @@ function onPointer(e) {
       d.vibTimer = 8;
     }
 
+    // Spawn drops at tap
     for (let i = 0; i < 4; i++)
       spawnAt(px + (Math.random() - 0.5) * 22, py + (Math.random() - 0.5) * 22);
   }
 }
 canvas.addEventListener('touchstart', onPointer, { passive: false });
 canvas.addEventListener('mousedown',  onPointer);
+document.addEventListener('mousedown', e => {
+  if (e.target !== canvas) showSettingsBtn();
+});
 
 // ── Resize / Init ─────────────────────────────────────────────────────────────
 function resizeCanvases() {
-  W = canvas.width = smallCvs.width  = window.innerWidth;
-  H = canvas.height = smallCvs.height = window.innerHeight;
+  // clientWidth/Height が UA の各種バー込みでも正確なビューポートサイズを返す
+  W = canvas.width  = smallCvs.width  = document.documentElement.clientWidth  || window.innerWidth;
+  H = canvas.height = smallCvs.height = document.documentElement.clientHeight || window.innerHeight;
 }
 
 function init() {
