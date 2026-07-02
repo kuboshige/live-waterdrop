@@ -13,48 +13,80 @@
 html,body{width:100%;height:100%;overflow:hidden;background:#1a2430}
 #small,#c{display:block;position:absolute;top:0;left:0;width:100%;height:100%;touch-action:none}
 #small{pointer-events:none}
+
 #fileBtn{
   position:fixed;bottom:16px;right:16px;
   width:42px;height:42px;border-radius:21px;
   background:rgba(0,0,0,0.35);backdrop-filter:blur(6px);
-  border:1px solid rgba(255,255,255,0.25);
+  border:1px solid rgba(255,255,255,0.22);
   display:flex;align-items:center;justify-content:center;
   cursor:pointer;font-size:18px;color:#fff;
   -webkit-user-select:none;user-select:none;
 }
 #fileIn{display:none}
+
+#settingsBtn{
+  position:fixed;bottom:16px;left:16px;
+  width:42px;height:42px;border-radius:21px;
+  background:rgba(0,0,0,0.35);backdrop-filter:blur(6px);
+  border:1px solid rgba(255,255,255,0.22);
+  display:flex;align-items:center;justify-content:center;
+  cursor:pointer;font-size:20px;color:#fff;
+  opacity:0;transition:opacity 0.35s;
+  -webkit-user-select:none;user-select:none;pointer-events:none;
+}
+#settingsBtn.vis{opacity:1;pointer-events:auto}
+
+#settingsPanel{
+  position:fixed;bottom:72px;left:16px;
+  background:rgba(8,18,28,0.88);backdrop-filter:blur(14px);
+  border:1px solid rgba(255,255,255,0.16);border-radius:14px;
+  padding:18px 20px;color:#ddeef8;font:13px/1.7 system-ui,sans-serif;
+  min-width:230px;display:none;
+}
+#settingsPanel.vis{display:block}
+.srow{margin-bottom:13px}
+.srow:last-child{margin-bottom:0}
+.slabel{display:flex;justify-content:space-between;margin-bottom:3px;font-size:12px}
+.slabel span{color:#aac8e0}
+input[type=range]{width:100%;cursor:pointer;accent-color:#5aaed4}
 </style>
 </head>
 <body>
-<svg style="position:absolute;width:0;height:0">
-  <defs>
-    <filter id="gooey" x="-20%" y="-20%" width="140%" height="140%">
-      <feGaussianBlur in="SourceGraphic" stdDeviation="6" result="blur"/>
-      <feColorMatrix in="blur" mode="matrix"
-        values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 20 -7"/>
-    </filter>
-  </defs>
-</svg>
 <canvas id="c"></canvas>
 <canvas id="small"></canvas>
 <div id="fileBtn" title="背景を変更">🖼</div>
 <input id="fileIn" type="file" accept="image/*">
+<div id="settingsBtn" title="設定">⚙</div>
+<div id="settingsPanel">
+  <div class="srow">
+    <div class="slabel">最小サイズ<span id="minRVal">1.0</span></div>
+    <input type="range" id="minRSlider" min="0.5" max="3.0" step="0.1" value="1.0">
+  </div>
+  <div class="srow">
+    <div class="slabel">最大サイズ<span id="maxRVal">6.0</span></div>
+    <input type="range" id="maxRSlider" min="3.0" max="12.0" step="0.5" value="6.0">
+  </div>
+  <div class="srow">
+    <div class="slabel">降雨強度<span id="spawnVal">中</span></div>
+    <input type="range" id="spawnSlider" min="1" max="5" step="1" value="3">
+  </div>
+</div>
+
 <script>
 'use strict';
 
 // ── Canvas ────────────────────────────────────────────────────────────────────
-const canvas    = document.getElementById('c');
-const ctx       = canvas.getContext('2d');
-const smallCvs  = document.getElementById('small');
-const smallCtx  = smallCvs.getContext('2d');
-const SMALL_R   = 6.5; // drops smaller than this go to untracked layer
-const gooCvs    = document.createElement('canvas'); // metaball silhouettes
-const gooCtx    = gooCvs.getContext('2d');
+const canvas   = document.getElementById('c');
+const ctx      = canvas.getContext('2d');
+const smallCvs = document.getElementById('small');
+const smallCtx = smallCvs.getContext('2d');
+const SMALL_R  = 5.5;  // tracked threshold
 let W = 0, H = 0;
 
-// Small-drop layer: fade each frame instead of clearing (ghosting effect)
+// Small-drop layer fades each frame
 function fadeSmallLayer(dt) {
-  smallCtx.globalAlpha = Math.pow(0.965, dt);
+  smallCtx.globalAlpha = Math.pow(0.968, dt);
   smallCtx.globalCompositeOperation = 'destination-in';
   smallCtx.fillRect(0, 0, W, H);
   smallCtx.globalCompositeOperation = 'source-over';
@@ -62,13 +94,16 @@ function fadeSmallLayer(dt) {
 }
 
 function drawSmallDrop(x, y, r) {
+  if (r < 0.4) return;
   smallCtx.beginPath();
   smallCtx.arc(x, y, r, 0, Math.PI * 2);
-  smallCtx.fillStyle = bgReady ? 'rgba(210,232,248,0.52)' : 'rgba(190,215,232,0.52)';
+  smallCtx.fillStyle = bgReady ? 'rgba(205,228,246,0.55)' : 'rgba(185,212,230,0.55)';
   smallCtx.fill();
-  smallCtx.strokeStyle = 'rgba(20,45,70,0.28)';
-  smallCtx.lineWidth = 0.45;
-  smallCtx.stroke();
+  if (r > 1.2) {
+    smallCtx.strokeStyle = 'rgba(18,42,68,0.26)';
+    smallCtx.lineWidth = 0.4;
+    smallCtx.stroke();
+  }
 }
 
 // ── Background ────────────────────────────────────────────────────────────────
@@ -76,7 +111,7 @@ let bgImg = null, bgCvs = null, bgCtx2 = null, bgReady = false;
 
 function updateBgCvs() {
   if (!bgImg || !W) return;
-  bgCvs = bgCvs || document.createElement('canvas');
+  bgCvs  = bgCvs  || document.createElement('canvas');
   bgCtx2 = bgCtx2 || bgCvs.getContext('2d');
   bgCvs.width = W; bgCvs.height = H;
   const sc = Math.max(W / bgImg.naturalWidth, H / bgImg.naturalHeight);
@@ -96,8 +131,7 @@ function loadImg(src) {
 document.getElementById('fileBtn').addEventListener('click', () =>
   document.getElementById('fileIn').click());
 document.getElementById('fileIn').addEventListener('change', e => {
-  const f = e.target.files[0];
-  if (f) loadImg(URL.createObjectURL(f));
+  const f = e.target.files[0]; if (f) loadImg(URL.createObjectURL(f));
 });
 canvas.addEventListener('dragover', e => e.preventDefault());
 canvas.addEventListener('drop', e => {
@@ -107,32 +141,35 @@ canvas.addEventListener('drop', e => {
 });
 
 // ── Config ────────────────────────────────────────────────────────────────────
+// Real raindrop stats: drizzle r≈0.05-0.3mm, light r≈0.3-1mm, mod r≈1-1.5mm
+// On ~70mm-wide phone screen ≈ 5.6px/mm → r≈1.7-5.6px for typical raindrops
+// Live-wallpaper aesthetic: bias toward small, occasional large for drama
 const CFG = {
-  spawnProb:    0.10,
-  minR:         2.0,
-  maxR:         8.0,
-  fallThresh:   11,
-  gravity:      0.20,
-  maxSpeed:     16,
-  maxDroplets:  600,
-  numStreaks:   18,
-  refrMag:      1.65,
-  trailDecay:   0.007,
-  beadThresh:   1.6,
-  beadProb:     0.12,
-  maxTrails:    20,
-  gridCell:     32,
+  spawnProb:      0.12,
+  minR:           1.0,
+  maxR:           6.0,
+  fallThresh:     10,
+  gravity:        0.22,
+  maxSpeed:       22,
+  maxDroplets:    500,
+  numStreaks:     16,
+  refrMag:        1.65,
+  trailDecay:     0.006,
+  beadThresh:     1.3,
+  beadProb:       0.20,
+  maxTrails:      24,
+  gridCell:       28,
+  depositSpeedMin:3.5,  // px/frame to start depositing trail drops
+  depositInterval:6,    // px between deposits
 };
 
 // ── Default background ────────────────────────────────────────────────────────
 function drawDefaultBg() {
-  // Overcast urban window look
   const g = ctx.createLinearGradient(0, 0, W * 0.4, H);
-  g.addColorStop(0,   '#bccbd4');
-  g.addColorStop(0.45,'#cad8e2');
-  g.addColorStop(1,   '#a8bfc9');
+  g.addColorStop(0,    '#bccbd4');
+  g.addColorStop(0.45, '#cad8e2');
+  g.addColorStop(1,    '#a8bfc9');
   ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
-  // Soft horizontal light bands
   for (let i = 0; i < 5; i++) {
     const yc = H * (0.1 + i * 0.18);
     const g2 = ctx.createLinearGradient(0, yc - 55, 0, yc + 55);
@@ -142,7 +179,6 @@ function drawDefaultBg() {
     ctx.fillStyle = g2; ctx.fillRect(0, yc - 55, W, 110);
   }
 }
-
 function drawBg() {
   if (bgReady && bgCvs) ctx.drawImage(bgCvs, 0, 0);
   else drawDefaultBg();
@@ -152,11 +188,11 @@ function drawBg() {
 class Streak {
   constructor(init) { this.reset(init); }
   reset(init) {
-    this.x = Math.random() * W;
-    this.y = init ? Math.random() * H : -22;
-    this.len = 8 + Math.random() * 16;
-    this.spd = 7 + Math.random() * 8;
-    this.a   = 0.05 + Math.random() * 0.10;
+    this.x   = Math.random() * W;
+    this.y   = init ? Math.random() * H : -22;
+    this.len = 8  + Math.random() * 16;
+    this.spd = 7  + Math.random() * 8;
+    this.a   = 0.04 + Math.random() * 0.09;
   }
   update() {
     this.x += this.spd * 0.10; this.y += this.spd;
@@ -169,29 +205,25 @@ class Streak {
     ctx.strokeStyle = bgReady
       ? `rgba(255,255,255,${this.a})`
       : `rgba(160,195,220,${this.a})`;
-    ctx.lineWidth = 0.65; ctx.stroke();
+    ctx.lineWidth = 0.6; ctx.stroke();
   }
 }
 let streaks = [];
 
-// ── Trail (persists on glass after drop exits) ────────────────────────────────
+// ── Trail (water mark that beads up after drop exits) ─────────────────────────
 class Trail {
   constructor(pts) {
-    // pts: [{x,y,w}]  recorded path of the parent droplet
     this.segs = pts.map(p => ({ x: p.x, y: p.y, w: p.w }));
     this.dead = false;
   }
-
   update(dt) {
-    const beads = [];
-    const alive = [];
+    const beads = [], alive = [];
     for (const s of this.segs) {
       s.w -= CFG.trailDecay * dt;
       if (s.w <= CFG.beadThresh) {
-        // Segment consumed: 12% chance it beads up into a tiny droplet
         if (Math.random() < CFG.beadProb)
-          beads.push({ x: s.x + (Math.random() - 0.5) * 4, y: s.y,
-                       r: 1.4 + Math.random() * 1.8 });
+          beads.push({ x: s.x + (Math.random() - 0.5) * 3, y: s.y,
+                       r: 1.0 + Math.random() * 1.6 });
       } else {
         alive.push(s);
       }
@@ -200,34 +232,32 @@ class Trail {
     this.dead = this.segs.length === 0;
     return beads;
   }
-
   draw() {
+    // Very faint — primary purpose is rebeading, not visibility
     if (this.segs.length < 2) return;
     for (let i = 0; i < this.segs.length - 1; i++) {
       const a = this.segs[i], b = this.segs[i + 1];
       const dx = b.x - a.x, dy = b.y - a.y;
-      if (dx * dx + dy * dy > 400) continue; // skip gaps
-
-      const w     = (a.w + b.w) * 0.5;
-      // Slight Plateau–Rayleigh wobble on width → looks like it's about to bead
-      const wobble = 1 + 0.18 * Math.sin(a.y * 0.55);
-      const alpha  = Math.min(0.52, (w - CFG.beadThresh) * 0.14);
-
+      if (dx * dx + dy * dy > 400) continue;
+      const w      = (a.w + b.w) * 0.5;
+      const wobble = 1 + 0.14 * Math.sin(a.y * 0.55);
+      const alpha  = Math.min(0.15, (w - CFG.beadThresh) * 0.035);
+      if (alpha <= 0) continue;
       ctx.beginPath();
       ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
       ctx.strokeStyle = bgReady
-        ? `rgba(220,235,248,${alpha})`
-        : `rgba(175,205,225,${alpha})`;
-      ctx.lineWidth = w * 2 * wobble;
+        ? `rgba(200,222,240,${alpha})`
+        : `rgba(160,192,215,${alpha})`;
+      ctx.lineWidth = w * 1.6 * wobble;
       ctx.lineCap  = 'round'; ctx.stroke();
     }
   }
 }
 
-// ── Spatial grid – O(n) collision detection ───────────────────────────────────
+// ── Spatial grid ──────────────────────────────────────────────────────────────
 class SpatialGrid {
   constructor() { this.cells = new Map(); }
-  clear() { this.cells.clear(); }
+  clear()       { this.cells.clear(); }
   insert(d, i) {
     const k = `${Math.floor(d.x/CFG.gridCell)},${Math.floor(d.y/CFG.gridCell)}`;
     let c = this.cells.get(k); if (!c) { c = []; this.cells.set(k, c); }
@@ -250,26 +280,32 @@ const grid = new SpatialGrid();
 class Droplet {
   constructor(x, y, r) {
     this.x = x; this.y = y; this.r = r;
-    this.vy = 0; this.vx = (Math.random() - 0.5) * 0.18;
+    this.vy = 0; this.vx = (Math.random() - 0.5) * 0.15;
     this.falling = false; this.dead = false; this.bump = 0;
-    this.trailPts = [];
-    this.lastTY   = y;
-    this.ttl = r < 5.0 ? 180 + Math.random() * 280 : Infinity;
-    // contact-line pinning: drop is pinned until r exceeds fallThresh + pinExtra
-    this.pinExtra  = 1.2 + Math.random() * 3.5; // random unpinning threshold
+    this.trailPts    = [];
+    this.lastTY      = y;
+    this.lastDepositY = y;
+    // Spawn impact spread: briefly larger collision radius so nearby drops merge
+    this.impact = 0.75;
+    // TTL for tiny beads
+    this.ttl = r < 3.5 ? 150 + Math.random() * 260 : Infinity;
+    // Contact-line pinning: narrower random range for hydrophobic surface
+    this.pinExtra  = 0.6 + Math.random() * 2.2;
     this.pinReleased = false;
-    // stick-slip state during fall
-    this.slipPhase = 0;   // cycles 0→slipPeriod; 0=stick, >half=slip
-    this.slipPeriod = 28 + Math.random() * 22;
-    // tap-vibration nudge
-    this.vibTimer  = 0;
+    // Stick-slip
+    this.slipPhase  = 0;
+    this.slipPeriod = 20 + Math.random() * 18;
+    this.vibTimer   = 0;
   }
 
   get area() { return Math.PI * this.r * this.r; }
 
   overlaps(o) {
-    const dx = this.x - o.x, dy = this.y - o.y;
-    const rr = (this.r + o.r) * 0.94;
+    const dx  = this.x - o.x, dy = this.y - o.y;
+    // Impact spread expands collision radius (causes spreading drop to absorb neighbors)
+    const myR = this.r * (1 + this.impact * 0.50);
+    const oR  = o.r   * (1 + o.impact   * 0.50);
+    const rr  = (myR + oR) * 0.92;
     return dx * dx + dy * dy < rr * rr;
   }
 
@@ -278,172 +314,159 @@ class Droplet {
     const v2 = o.r   * o.r   * o.r;
     const vt = v1 + v2;
     if (!this.falling) {
-      // r⁵ weighting: strongly biased toward the larger drop's position
-      const w1 = v1 * this.r * this.r;
-      const w2 = v2 * o.r   * o.r;
-      const wt = w1 + w2;
+      const w1 = v1 * this.r * this.r, w2 = v2 * o.r * o.r, wt = w1 + w2;
       this.x = (this.x * w1 + o.x * w2) / wt;
       this.y = (this.y * w1 + o.y * w2) / wt;
     }
-    this.r    = Math.cbrt(vt);
-    this.ttl  = Infinity;
-    this.bump = 0.14;
-    if (o.vy > this.vy) this.vy = o.vy * 0.5;
+    this.r   = Math.cbrt(vt);
+    this.ttl = Infinity;
+    this.bump = Math.max(this.bump, 0.12);
+    if (o.vy > this.vy) this.vy = o.vy * 0.45;
     o.dead = true;
   }
 
   update(dt) {
-    // tiny bead evaporation
     if (this.ttl !== Infinity) {
       this.ttl -= dt;
       if (this.ttl <= 0) { this.dead = true; return; }
     }
 
-    if (this.bump > 0) this.bump = Math.max(0, this.bump - 0.012 * dt);
+    if (this.impact   > 0) this.impact   = Math.max(0, this.impact   - 0.09 * dt);
+    if (this.bump     > 0) this.bump     = Math.max(0, this.bump     - 0.012 * dt);
     if (this.vibTimer > 0) this.vibTimer = Math.max(0, this.vibTimer - dt);
 
-    // Contact-line pinning: drop doesn't fall until r exceeds fallThresh + pinExtra
+    // Contact-line pinning release
     if (!this.falling && this.r >= CFG.fallThresh + this.pinExtra) {
-      this.falling = true;
+      this.falling     = true;
       this.pinReleased = true;
-      this.vy = 0.6 + Math.random() * 0.4; // release jerk
-      this.lastTY = this.y;
-      this.slipPhase = this.slipPeriod * 0.55; // start mid-slip
+      this.vy          = 0.8 + Math.random() * 0.7; // release jerk
+      this.lastTY      = this.y;
+      this.lastDepositY = this.y;
+      this.slipPhase   = this.slipPeriod * 0.6;
     }
 
     if (this.falling) {
-      // Stokes-like: terminal velocity ∝ r² (larger drops accelerate much faster)
-      const rn   = (this.r - CFG.fallThresh) / CFG.fallThresh;
-      const vMax = Math.min(CFG.maxSpeed, 0.5 + rn * rn * 14 + rn * 2);
+      const excess = this.r - CFG.fallThresh;
+      // Quadratic speed scaling — large drops accelerate dramatically
+      const vMax = Math.min(CFG.maxSpeed, Math.max(1.5, excess * excess * 0.10 + excess * 0.40));
 
-      // Stick-slip: alternate between deceleration (stick) and free-fall (slip)
+      // Stick-slip: larger drops have much less sticking (hydrophobic surface)
       this.slipPhase = (this.slipPhase + dt) % this.slipPeriod;
-      const sticking = this.slipPhase < this.slipPeriod * 0.38;
-      const gravMul  = sticking ? 0.08 : 1.0; // nearly halted during stick
-      const drag     = sticking ? Math.pow(0.78, dt) : 1.0;
+      const slipRatio = Math.max(0.06, 0.24 - excess * 0.014);
+      const sticking  = this.slipPhase < this.slipPeriod * slipRatio;
+      const gravMul   = sticking ? 0.05 : 1.0;
+      const drag      = sticking ? Math.pow(0.82, dt) : 1.0;
 
       this.vy  = Math.min(this.vy * drag + CFG.gravity * gravMul * dt, vMax);
       this.y  += this.vy * dt;
       this.x  += this.vx * dt;
-      this.vx *= Math.pow(0.92, dt);
+      this.vx *= Math.pow(0.93, dt);
 
-      // Record trail points every 3 px of vertical travel
-      if (this.y - this.lastTY >= 3) {
-        this.trailPts.push({ x: this.x, y: this.lastTY + 1.5, w: this.r * 0.36 });
+      // Deposit tiny drops along path when falling fast (trail of beads)
+      if (this.vy > CFG.depositSpeedMin) {
+        const dist = this.y - this.lastDepositY;
+        if (dist >= CFG.depositInterval) {
+          const dr = 0.6 + Math.random() * 1.4;
+          drawSmallDrop(
+            this.x + (Math.random() - 0.5) * this.r * 0.55,
+            this.lastDepositY + dist * Math.random(),
+            dr
+          );
+          this.lastDepositY = this.y;
+        }
+      } else {
+        this.lastDepositY = this.y;
+      }
+
+      // Record path for post-exit Trail (rebeading)
+      if (this.y - this.lastTY >= 4) {
+        this.trailPts.push({ x: this.x, y: this.lastTY + 2, w: this.r * 0.28 });
         this.lastTY = this.y;
-        if (this.trailPts.length > 220) this.trailPts.shift();
+        if (this.trailPts.length > 200) this.trailPts.shift();
       }
 
       if (this.y - this.r > H) this.dead = true;
     }
   }
 
-  // ── Drawing helpers ────────────────────────────────────────────────────────
-
-  _drawTrailLines(pts) {
-    const n = pts.length;
-    if (n < 2) return;
-    for (let i = 0; i < n - 1; i++) {
-      const a = pts[i], b = pts[i + 1];
-      const dx = b.x - a.x, dy = b.y - a.y;
-      if (dx * dx + dy * dy > 400) continue;
-      const w     = (a.w + b.w) * 0.5;
-      const t     = i / n; // 0=oldest, 1=newest
-      const wobble = 1 + 0.16 * Math.sin(a.y * 0.52);
-      const alpha  = Math.min(0.50, w * 0.14) * (0.25 + t * 0.75);
-      ctx.beginPath();
-      ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
-      ctx.strokeStyle = bgReady
-        ? `rgba(220,235,248,${alpha})`
-        : `rgba(175,205,225,${alpha})`;
-      ctx.lineWidth = w * 2 * wobble;
-      ctx.lineCap  = 'round'; ctx.stroke();
-    }
-  }
-
   draw() {
-    const r = this.r * (1 + Math.max(0, this.bump));
+    const impRad = 1 + Math.max(0, this.impact * 0.28);
+    const r = this.r * (1 + Math.max(0, this.bump)) * impRad;
 
-    // Aerodynamic deformation: speed → oblate ellipse (wider than tall)
-    // Weber number analogy: deformation ∝ v² at high speed
+    // Oblate deformation: speed-based (and gentle spread during impact)
     const spd = this.falling ? Math.abs(this.vy) : 0;
-    const t   = Math.min(1, spd / CFG.maxSpeed);          // 0..1 normalized speed
-    const sxRaw = 1 + t * t * 0.55;                       // up to 1.55× wide
-    const sx  = this.falling ? sxRaw : 1;
-    const sy  = this.falling ? Math.max(0.58, 1 / (sx * 1.12)) : 1;
-    const rx  = r * sx;
-    const ry  = r * sy;
+    const tn  = Math.min(1, spd / CFG.maxSpeed);
+    let sx = 1, sy = 1;
+    if (this.falling) {
+      sx = 1 + tn * tn * 0.55;
+      sy = Math.max(0.58, 1 / (sx * 1.12));
+    } else if (this.impact > 0) {
+      // Spreading on impact: briefly wider/flatter
+      sx = 1 + this.impact * 0.22;
+      sy = Math.max(0.78, 1 / (sx * 1.06));
+    }
+    const rx = r * sx, ry = r * sy;
 
-    // Draw live trail first (behind the droplet body)
-    if (this.falling && this.trailPts.length >= 2)
-      this._drawTrailLines(this.trailPts);
+    // No live trail lines drawn here — fast drops deposit via drawSmallDrop
 
-    // ── Tiny droplets: no refraction (too small to matter) ─────────────────
-    if (r < 3.5) {
+    if (r < 3.2) {
       ctx.beginPath();
       ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
-      ctx.fillStyle = bgReady ? 'rgba(210,228,242,0.50)' : 'rgba(190,215,230,0.50)';
+      ctx.fillStyle = bgReady ? 'rgba(210,228,242,0.52)' : 'rgba(190,215,230,0.52)';
       ctx.fill();
-      ctx.strokeStyle = 'rgba(30,55,80,0.32)';
-      ctx.lineWidth = 0.5; ctx.stroke();
+      ctx.strokeStyle = 'rgba(30,55,80,0.28)';
+      ctx.lineWidth = 0.45; ctx.stroke();
       return;
     }
 
-    // ── Full-size droplet ──────────────────────────────────────────────────
-    ctx.save();
+    const isEllipse = Math.abs(sx - 1) > 0.02 || Math.abs(sy - 1) > 0.02;
 
-    // Clip ellipse (or circle when static)
+    ctx.save();
     ctx.beginPath();
-    if (this.falling) {
-      ctx.ellipse(this.x, this.y, rx, ry, 0, 0, Math.PI * 2);
-    } else {
-      ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
-    }
+    if (isEllipse) ctx.ellipse(this.x, this.y, rx, ry, 0, 0, Math.PI * 2);
+    else           ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
     ctx.clip();
 
-    // ── Refraction: flip + magnify background (convex water-lens effect) ───
+    // Refraction
     if (bgReady && bgCvs) {
       ctx.save();
       ctx.translate(this.x, this.y);
-      ctx.scale(-CFG.refrMag, -CFG.refrMag); // negative = invert both axes
+      ctx.scale(-CFG.refrMag, -CFG.refrMag);
       ctx.translate(-this.x, -this.y);
       ctx.drawImage(bgCvs, 0, 0);
       ctx.restore();
     } else {
-      ctx.fillStyle = 'rgba(210,228,242,0.75)';
-      ctx.fillRect(this.x - r, this.y - r, r * 2, r * 2);
+      ctx.fillStyle = 'rgba(210,228,242,0.78)';
+      ctx.fillRect(this.x - rx, this.y - ry, rx * 2, ry * 2);
     }
 
-    // ── Edge darkening (depth / total-internal-reflection rim) ─────────────
+    // Edge darkening
     const rMax = Math.max(rx, ry);
-    const eg = ctx.createRadialGradient(this.x, this.y, rMax * 0.52, this.x, this.y, rMax);
+    const eg = ctx.createRadialGradient(this.x, this.y, rMax * 0.50, this.x, this.y, rMax);
     eg.addColorStop(0, 'rgba(0,0,0,0)');
-    eg.addColorStop(1, 'rgba(0,0,0,0.28)');
+    eg.addColorStop(1, 'rgba(0,0,0,0.26)');
     ctx.fillStyle = eg;
     ctx.fillRect(this.x - rx, this.y - ry, rx * 2, ry * 2);
 
-    // ── Specular crescent (upper-left highlight) ───────────────────────────
+    // Specular crescent
     const sp = ctx.createRadialGradient(
-      this.x - rx * 0.30, this.y - ry * 0.36, 0,
-      this.x - rx * 0.08, this.y - ry * 0.12, rMax * 0.60
+      this.x - rx * 0.28, this.y - ry * 0.34, 0,
+      this.x - rx * 0.07, this.y - ry * 0.10, rMax * 0.58
     );
-    sp.addColorStop(0,    'rgba(255,255,255,0.72)');
-    sp.addColorStop(0.38, 'rgba(255,255,255,0.20)');
+    sp.addColorStop(0,    'rgba(255,255,255,0.70)');
+    sp.addColorStop(0.38, 'rgba(255,255,255,0.18)');
     sp.addColorStop(1,    'rgba(255,255,255,0)');
     ctx.fillStyle = sp;
     ctx.fillRect(this.x - rx, this.y - ry, rx * 2, ry * 2);
 
-    ctx.restore(); // release clip
+    ctx.restore();
 
-    // ── Dark ring border (characteristic of real drops on glass) ──────────
+    // Dark ring border
     ctx.beginPath();
-    if (this.falling) {
-      ctx.ellipse(this.x, this.y, rx, ry, 0, 0, Math.PI * 2);
-    } else {
-      ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
-    }
-    ctx.strokeStyle = 'rgba(0,12,28,0.42)';
-    ctx.lineWidth   = Math.max(0.7, r * 0.055);
+    if (isEllipse) ctx.ellipse(this.x, this.y, rx, ry, 0, 0, Math.PI * 2);
+    else           ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(0,12,28,0.40)';
+    ctx.lineWidth   = Math.max(0.6, r * 0.052);
     ctx.stroke();
   }
 }
@@ -452,9 +475,12 @@ class Droplet {
 let droplets = [], trails = [];
 
 function spawnAt(x, y, r) {
-  r = r ?? (CFG.minR + Math.random() * (CFG.maxR - CFG.minR));
+  if (r === undefined) {
+    // Power-law bias toward smaller drops (matches real rain drop size distribution)
+    const rnd = Math.pow(Math.random(), 2.4);
+    r = CFG.minR + rnd * (CFG.maxR - CFG.minR);
+  }
   if (r < SMALL_R) {
-    // Small drops: draw directly to untracked layer, no object created
     drawSmallDrop(x, y, r);
     return;
   }
@@ -465,9 +491,9 @@ function spawnAt(x, y, r) {
 function randomSpawn() {
   const cx = CFG.maxR + Math.random() * (W - CFG.maxR * 2);
   const cy = CFG.maxR + Math.random() * (H * 0.88 - CFG.maxR * 2);
-  const n  = Math.random() < 0.5 ? 1 : Math.random() < 0.62 ? 2 : 3;
+  const n  = Math.random() < 0.58 ? 1 : Math.random() < 0.68 ? 2 : 3;
   for (let i = 0; i < n; i++) {
-    const a = Math.random() * Math.PI * 2, d = Math.random() * 8;
+    const a = Math.random() * Math.PI * 2, d = Math.random() * 6;
     spawnAt(cx + Math.cos(a) * d, cy + Math.sin(a) * d);
   }
 }
@@ -482,10 +508,10 @@ function processMerges() {
       if (j <= i || droplets[j].dead) continue;
       if (!droplets[i].overlaps(droplets[j])) continue;
       const fi = droplets[i].falling, fj = droplets[j].falling;
-      if      ( fi && !fj)                      droplets[i].absorb(droplets[j]);
-      else if (!fi &&  fj)                      droplets[j].absorb(droplets[i]);
-      else if (droplets[i].r >= droplets[j].r)  droplets[i].absorb(droplets[j]);
-      else                                       droplets[j].absorb(droplets[i]);
+      if      ( fi && !fj)                     droplets[i].absorb(droplets[j]);
+      else if (!fi &&  fj)                     droplets[j].absorb(droplets[i]);
+      else if (droplets[i].r >= droplets[j].r) droplets[i].absorb(droplets[j]);
+      else                                     droplets[j].absorb(droplets[i]);
     }
   }
 }
@@ -503,7 +529,7 @@ function frame(ts) {
   for (const d of droplets) d.update(dt);
   processMerges();
 
-  // Cull dead; harvest trails from droplets that just exited
+  // Cull dead; harvest trails
   const alive = [];
   for (const d of droplets) {
     if (d.dead) {
@@ -515,7 +541,7 @@ function frame(ts) {
   }
   droplets = alive;
 
-  // Update persistent trails; rebeading spawns new tiny droplets
+  // Update trails; rebeading
   const aliveT = [];
   for (const t of trails) {
     const beads = t.update(dt);
@@ -531,77 +557,107 @@ function frame(ts) {
   for (const s of streaks) { s.update(); s.draw(); }
   for (const t of trails)   t.draw();
 
-  // Metaball gooey layer: organic blob silhouettes for all tracked drops
-  gooCtx.clearRect(0, 0, W, H);
-  for (const d of droplets) {
-    if (d.dead) continue;
-    const spd = d.falling ? Math.abs(d.vy) : 0;
-    const tn  = Math.min(1, spd / CFG.maxSpeed);
-    const sx  = d.falling ? 1 + tn * tn * 0.55 : 1;
-    const sy  = d.falling ? Math.max(0.58, 1 / (sx * 1.12)) : 1;
-    gooCtx.beginPath();
-    gooCtx.ellipse(d.x, d.y, d.r * sx + 0.8, d.r * sy + 0.8, 0, 0, Math.PI * 2);
-    gooCtx.fillStyle = bgReady ? 'rgba(165,210,240,0.88)' : 'rgba(175,210,235,0.88)';
-    gooCtx.fill();
-  }
-  ctx.filter = 'url(#gooey)';
-  ctx.drawImage(gooCvs, 0, 0);
-  ctx.filter = 'none';
-
-  // Drop detail on top: refraction, specular, borders
   for (const d of droplets) if (!d.falling) d.draw();
   for (const d of droplets) if ( d.falling) d.draw();
 
   // Glass top-shine
   const shine = ctx.createLinearGradient(0, 0, 0, H * 0.07);
-  shine.addColorStop(0, 'rgba(255,255,255,0.055)');
+  shine.addColorStop(0, 'rgba(255,255,255,0.052)');
   shine.addColorStop(1, 'rgba(255,255,255,0)');
   ctx.fillStyle = shine; ctx.fillRect(0, 0, W, H * 0.07);
 
   // Vignette
   const vg = ctx.createRadialGradient(W/2, H/2, H * 0.28, W/2, H/2, H * 0.75);
   vg.addColorStop(0, 'rgba(0,0,0,0)');
-  vg.addColorStop(1, 'rgba(0,0,0,0.32)');
+  vg.addColorStop(1, 'rgba(0,0,0,0.30)');
   ctx.fillStyle = vg; ctx.fillRect(0, 0, W, H);
 
   requestAnimationFrame(frame);
 }
 
+// ── Settings panel ────────────────────────────────────────────────────────────
+const settingsBtn   = document.getElementById('settingsBtn');
+const settingsPanel = document.getElementById('settingsPanel');
+let settingsTimer   = null;
+
+function showSettingsBtn() {
+  settingsBtn.classList.add('vis');
+  clearTimeout(settingsTimer);
+  if (!settingsPanel.classList.contains('vis')) {
+    settingsTimer = setTimeout(() => settingsBtn.classList.remove('vis'), 2800);
+  }
+}
+
+settingsBtn.addEventListener('click', () => {
+  settingsPanel.classList.toggle('vis');
+  clearTimeout(settingsTimer);
+  if (!settingsPanel.classList.contains('vis')) {
+    settingsTimer = setTimeout(() => settingsBtn.classList.remove('vis'), 2000);
+  }
+});
+
+// Close settings when tapping main canvas
+canvas.addEventListener('touchstart', () => {
+  if (settingsPanel.classList.contains('vis')) {
+    settingsPanel.classList.remove('vis');
+    settingsTimer = setTimeout(() => settingsBtn.classList.remove('vis'), 1500);
+  }
+}, { passive: true });
+
+const spawnLabels = ['霧雨', '小雨', '中雨', '大雨', '豪雨'];
+const spawnProbs  = [0.04, 0.07, 0.12, 0.20, 0.32];
+
+document.getElementById('minRSlider').addEventListener('input', e => {
+  CFG.minR = parseFloat(e.target.value);
+  document.getElementById('minRVal').textContent = CFG.minR.toFixed(1);
+});
+document.getElementById('maxRSlider').addEventListener('input', e => {
+  CFG.maxR = parseFloat(e.target.value);
+  document.getElementById('maxRVal').textContent = CFG.maxR.toFixed(1);
+});
+document.getElementById('spawnSlider').addEventListener('input', e => {
+  const v = parseInt(e.target.value) - 1;
+  CFG.spawnProb = spawnProbs[v];
+  document.getElementById('spawnVal').textContent = spawnLabels[v];
+});
+
 // ── Input ─────────────────────────────────────────────────────────────────────
 function onPointer(e) {
   if (e.target !== canvas) return;
   e.preventDefault();
+  showSettingsBtn();
   const pts  = e.changedTouches ?? [e];
   const rect = canvas.getBoundingClientRect();
-  const scx = W / rect.width, scy = H / rect.height;
+  const scx  = W / rect.width, scy = H / rect.height;
   for (const p of pts) {
     const px = (p.clientX - rect.left) * scx;
     const py = (p.clientY - rect.top)  * scy;
 
-    // Tap vibration: near-threshold static drops nudge downward
+    // Tap vibration: near-threshold drops nudge downward
     const vibrThresh = CFG.fallThresh * 0.72;
     for (const d of droplets) {
       if (d.falling || d.r < vibrThresh) continue;
-      // vibration strength scales with how close the drop is to threshold
-      const ratio  = (d.r - vibrThresh) / (CFG.fallThresh - vibrThresh + d.pinExtra);
-      const nudge  = ratio * d.r * 0.55;
-      d.y         += nudge;
-      d.bump       = Math.max(d.bump, 0.08 + ratio * 0.1);
-      d.vibTimer   = 8;
+      const ratio = (d.r - vibrThresh) / (CFG.fallThresh - vibrThresh + d.pinExtra);
+      d.y    += ratio * d.r * 0.50;
+      d.bump  = Math.max(d.bump, 0.07 + ratio * 0.09);
+      d.vibTimer = 8;
     }
 
-    // Also spawn a few new drops at tap location
+    // Spawn drops at tap
     for (let i = 0; i < 4; i++)
-      spawnAt(px + (Math.random() - 0.5) * 20, py + (Math.random() - 0.5) * 20);
+      spawnAt(px + (Math.random() - 0.5) * 22, py + (Math.random() - 0.5) * 22);
   }
 }
 canvas.addEventListener('touchstart', onPointer, { passive: false });
 canvas.addEventListener('mousedown',  onPointer);
+document.addEventListener('mousedown', e => {
+  if (e.target !== canvas) showSettingsBtn();
+});
 
 // ── Resize / Init ─────────────────────────────────────────────────────────────
 function resizeCanvases() {
-  W = canvas.width  = smallCvs.width  = gooCvs.width  = window.innerWidth;
-  H = canvas.height = smallCvs.height = gooCvs.height = window.innerHeight;
+  W = canvas.width = smallCvs.width  = window.innerWidth;
+  H = canvas.height = smallCvs.height = window.innerHeight;
 }
 
 function init() {
@@ -609,7 +665,7 @@ function init() {
   updateBgCvs();
   streaks  = Array.from({ length: CFG.numStreaks }, () => new Streak(true));
   droplets = []; trails = [];
-  for (let i = 0; i < 30; i++) randomSpawn();
+  for (let i = 0; i < 28; i++) randomSpawn();
 }
 
 window.addEventListener('resize', () => {
