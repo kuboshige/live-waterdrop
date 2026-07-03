@@ -107,7 +107,7 @@ function updateHud(dt) {
   hudEl.textContent =
     `FPS ${avg(fpsBuf).toFixed(0)}\n` +
     `ms  ${avg(msBuf).toFixed(1)} / max ${mx(msBuf).toFixed(1)}\n` +
-    `drops ${droplets.length}  trails ${trails.length}\n` +
+    `drops ${droplets.length}\n` +
     `bg ${bgDark ? 'dark' : 'light'}${bgHasImg ? ' img' : ''}  test ${modes[testBgMode]}`;
 }
 
@@ -145,34 +145,27 @@ function drawSmallDrop(x, y, r) {
   }
 }
 
-// Draw a kamaboko water-ridge trail path (used for both live and dead trails)
-function drawTrailSegs(segs, extraX, extraY) {
-  const hasExtra = extraX !== undefined;
-  const totalPts = segs.length + (hasExtra ? 1 : 0);
-  if (totalPts < 2) return;
-  const r = segs[segs.length - 1].r;
-  const trailW = Math.max(2, r * 0.38);
-  const buildPath = () => {
-    ctx.beginPath();
-    ctx.moveTo(segs[0].x, segs[0].y);
-    for (let i = 1; i < segs.length; i++) ctx.lineTo(segs[i].x, segs[i].y);
-    if (hasExtra) ctx.lineTo(extraX, extraY);
-  };
-  ctx.save();
-  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-  buildPath();
-  ctx.lineWidth = trailW + 1;
-  ctx.strokeStyle = 'rgba(40,80,110,0.18)';
-  ctx.stroke();
-  buildPath();
-  ctx.lineWidth = trailW;
-  ctx.strokeStyle = bgHasImg ? 'rgba(195,222,240,0.42)' : 'rgba(175,207,228,0.42)';
-  ctx.stroke();
-  buildPath();
-  ctx.lineWidth = trailW * 0.40;
-  ctx.strokeStyle = 'rgba(220,240,255,0.20)';
-  ctx.stroke();
-  ctx.restore();
+// Hydrophobic surface: a running drop leaves NO lasting ridge — only a short,
+// tapered tail directly behind it (max ~2.5r), fading to nothing. The path
+// itself is wiped clean (see the sweep in Droplet.update).
+function drawTail(d) {
+  const vlen = Math.hypot(d.vx, d.vy);
+  if (vlen < 0.001) return;
+  const len = 2.4 * d.r;
+  const ux = -d.vx / vlen, uy = -d.vy / vlen;   // unit vector opposite to motion
+  const ex = d.x + ux * len, ey = d.y + uy * len; // tail tip
+  const nx = -uy, ny = ux;                        // perpendicular
+  const w = d.r * 0.42;                           // half-width at the drop
+  ctx.beginPath();
+  ctx.moveTo(d.x + nx * w, d.y + ny * w);
+  ctx.lineTo(d.x - nx * w, d.y - ny * w);
+  ctx.lineTo(ex, ey);
+  ctx.closePath();
+  const g = ctx.createLinearGradient(d.x, d.y, ex, ey);
+  g.addColorStop(0, bgHasImg ? 'rgba(200,224,242,0.34)' : 'rgba(180,210,230,0.34)');
+  g.addColorStop(1, 'rgba(200,224,242,0)');
+  ctx.fillStyle = g;
+  ctx.fill();
 }
 
 // ── Background ────────────────────────────────────────────────────────────────
@@ -273,13 +266,8 @@ const CFG = {
   maxDroplets:    500,
   numStreaks:     16,
   refrMag:        1.65,
-  trailDecay:     0.006,
-  beadThresh:     1.3,
-  beadProb:       0.20,
-  maxTrails:      24,
-  trailConsumeSpeed: 3.5,
   gridCell:       28,
-  depositSpeedMin:2.8,
+  depositSpeedMin:2.8,   // vy above which a drop is "running" (sweeps / tails)
   depositInterval:4,
 };
 
@@ -351,33 +339,6 @@ class Streak {
 }
 let streaks = [];
 
-// ── Trail (water mark that beads up after drop exits) ─────────────────────────
-class Trail {
-  constructor(pts) {
-    this.segs = pts.map(p => ({ x: p.x, y: p.y, r: p.r }));
-    this.dead = false;
-    this.consumed = 0; // px consumed from the top (oldest) end
-  }
-  update(dt) {
-    const beads = [];
-    this.consumed += CFG.trailConsumeSpeed * dt;
-    const segPx = 4;
-    const removeCount = Math.floor(this.consumed / segPx);
-    for (let i = 0; i < Math.min(removeCount, this.segs.length); i++) {
-      if (Math.random() < 0.42)
-        beads.push({ x: this.segs[i].x + (Math.random() - 0.5) * 5, y: this.segs[i].y,
-                     r: 2.2 + Math.random() * 2.8 });
-    }
-    if (removeCount > 0) {
-      this.segs.splice(0, Math.min(removeCount, this.segs.length));
-      this.consumed -= removeCount * segPx;
-    }
-    this.dead = this.segs.length < 2;
-    return beads;
-  }
-  draw() { drawTrailSegs(this.segs); }
-}
-
 // ── Spatial grid ──────────────────────────────────────────────────────────────
 class SpatialGrid {
   constructor() { this.cells = new Map(); }
@@ -404,10 +365,10 @@ const grid = new SpatialGrid();
 class Droplet {
   constructor(x, y, r) {
     this.x = x; this.y = y; this.r = r;
+    this.px = x; this.py = y;           // previous position (for path sweeping)
     this.vy = 0; this.vx = (Math.random() - 0.5) * 0.15;
     this.falling = false; this.dead = false; this.bump = 0;
-    this.trailPts    = [];
-    this.lastTY      = y;
+    this.age = Math.random() * 100;     // for per-drop tremble / wander phase
     this.lastDepositY = y;
     // Spawn impact spread: briefly larger collision radius so nearby drops merge
     this.impact = 0.75;
@@ -420,6 +381,10 @@ class Droplet {
     this.slipPhase  = 0;
     this.slipPeriod = 20 + Math.random() * 18;
     this.vibTimer   = 0;
+    // Coalescence oscillation ("ぷるぷる"): amplitude, phase, angular freq
+    this.osc = 0; this.oscPhase = 0; this.oscFreq = 0;
+    // Meander: per-drop wander frequency for a non-straight run
+    this.wanderF = 0.05 + Math.random() * 0.05;
   }
 
   get area() { return Math.PI * this.r * this.r; }
@@ -453,7 +418,13 @@ class Droplet {
     }
     this.r   = Math.cbrt(vt);
     this.ttl = Infinity;
-    this.bump = Math.max(this.bump, 0.12);
+    // Coalescence oscillation: surface tension makes the merged drop wobble.
+    // Amplitude grows with how much (relatively) was just swallowed; larger
+    // drops wobble slower (Rayleigh f ∝ 1/√r³).
+    const grew = v2 / vt;                       // fraction of new volume absorbed
+    this.osc      = Math.min(0.26, this.osc + 0.10 + grew * 0.45);
+    this.oscPhase = 0;
+    this.oscFreq  = (Math.PI * 2) / (14 + this.r * 0.7);
     if (o.vy > this.vy) this.vy = o.vy * 0.45;
     o.dead = true;
   }
@@ -464,17 +435,26 @@ class Droplet {
       if (this.ttl <= 0) { this.dead = true; return; }
     }
 
+    this.age += dt;
     if (this.impact   > 0) this.impact   = Math.max(0, this.impact   - 0.09 * dt);
     if (this.bump     > 0) this.bump     = Math.max(0, this.bump     - 0.012 * dt);
     if (this.vibTimer > 0) this.vibTimer = Math.max(0, this.vibTimer - dt);
+
+    // Coalescence oscillation decay (~0.3s to settle)
+    if (this.osc > 0.003) {
+      this.oscPhase += this.oscFreq * dt;
+      this.osc      *= Math.pow(0.89, dt);
+    } else {
+      this.osc = 0;
+    }
 
     // Contact-line pinning release
     if (!this.falling && this.r >= CFG.fallThresh + this.pinExtra) {
       this.falling     = true;
       this.pinReleased = true;
       this.vy          = 0.8 + Math.random() * 0.7; // release jerk
-      this.lastTY      = this.y;
       this.lastDepositY = this.y;
+      this.px = this.x; this.py = this.y;           // start sweep from here
       this.slipPhase   = this.slipPeriod * 0.6;
     }
 
@@ -489,41 +469,67 @@ class Droplet {
       const sticking  = this.slipPhase < this.slipPeriod * slipRatio;
       const gravMul   = sticking ? 0.05 : 1.0;
       const drag      = sticking ? Math.pow(0.82, dt) : 1.0;
+      // Mass feel: bigger drops accelerate more sluggishly (heavier) even though
+      // their top speed is higher — so they start slow and build up weightily.
+      const massMul   = Math.max(0.55, 1 - excess * 0.02);
 
-      this.vy  = Math.min(this.vy * drag + CFG.gravity * gravMul * dt, vMax);
+      this.vy  = Math.min(this.vy * drag + CFG.gravity * gravMul * massMul * dt, vMax);
+
+      // Meander: low-frequency lateral wander so the run isn't a straight line
+      this.vx += (Math.sin(this.age * this.wanderF)
+                + Math.sin(this.age * this.wanderF * 2.3) * 0.5) * 0.03 * dt;
+
+      // Attraction: gently veer toward the nearest static drop just ahead so the
+      // run "reaches out" and swallows it (only scans while falling — cheap).
+      let best = null, bestD = 1e9;
+      for (const o of droplets) {
+        if (o === this || o.falling || o.dead) continue;
+        const ddx = o.x - this.x, ddy = o.y - this.y;
+        if (ddy < 0 || ddy > 4 * this.r || Math.abs(ddx) > 2 * this.r) continue;
+        const dd = ddx * ddx + ddy * ddy;
+        if (dd < bestD) { bestD = dd; best = o; }
+      }
+      if (best) this.vx += Math.sign(best.x - this.x) * 0.035 * dt;
+
       this.y  += this.vy * dt;
       this.x  += this.vx * dt;
       this.vx *= Math.pow(0.93, dt);
 
-      // Deposit tiny drops along path when falling fast (trail of beads)
+      // Hydrophobic sweep: wipe the small-drop layer clean along the path, and
+      // occasionally leave a tiny satellite bead beside it or a torn bead behind.
       if (this.vy > CFG.depositSpeedMin) {
+        smallCtx.save();
+        smallCtx.globalCompositeOperation = 'destination-out';
+        smallCtx.strokeStyle = 'rgba(0,0,0,1)';
+        smallCtx.lineCap = 'round';
+        smallCtx.lineWidth = this.r * 1.9;
+        smallCtx.beginPath();
+        smallCtx.moveTo(this.px, this.py);
+        smallCtx.lineTo(this.x, this.y);
+        smallCtx.stroke();
+        smallCtx.restore();
+
         const dist = this.y - this.lastDepositY;
         if (dist >= CFG.depositInterval) {
-          const dr = 0.6 + Math.random() * 1.4;
-          drawSmallDrop(
-            this.x + (Math.random() - 0.5) * this.r * 0.55,
-            this.lastDepositY + dist * Math.random(),
-            dr
-          );
+          if (Math.random() < 0.15) {            // satellite beside the wiped path
+            const side = Math.random() < 0.5 ? -1 : 1;
+            drawSmallDrop(this.x + side * (0.9 + Math.random() * 0.6) * this.r,
+                          this.lastDepositY + dist * Math.random(),
+                          0.5 + Math.random() * 1.1);
+          }
+          if (sticking && Math.random() < 0.10)  // torn bead when it hitches
+            drawSmallDrop(this.x + (Math.random() - 0.5) * this.r * 0.6,
+                          this.y - this.r * 0.9, 1.0 + Math.random() * 1.4);
           this.lastDepositY = this.y;
         }
       } else {
         this.lastDepositY = this.y;
       }
 
-      // Record trail only where drop is already fast — avoids trail appearing at fall start
-      if (this.vy > CFG.depositSpeedMin) {
-        if (this.y - this.lastTY >= 4) {
-          this.trailPts.push({ x: this.x, y: this.lastTY + 2, r: this.r });
-          this.lastTY = this.y;
-          if (this.trailPts.length > 200) this.trailPts.shift();
-        }
-      } else {
-        this.lastTY = this.y;
-      }
-
       if (this.y - this.r > H) this.dead = true;
     }
+
+    this.px = this.x; this.py = this.y;
   }
 
   draw() {
@@ -541,6 +547,21 @@ class Droplet {
       // Spreading on impact: briefly wider/flatter
       sx = 1 + this.impact * 0.22;
       sy = Math.max(0.78, 1 / (sx * 1.06));
+    } else {
+      // Pre-release omen: nearing the tipping size, it stretches and trembles
+      const preStart = CFG.fallThresh * 0.85;
+      const releaseR = CFG.fallThresh + this.pinExtra;
+      const near = Math.max(0, Math.min(1, (this.r - preStart) / (releaseR - preStart)));
+      if (near > 0) {
+        sy = 1 + near * 0.06;
+        const tr = Math.sin(this.age * 0.5) * near * 0.015;
+        sx += tr; sy -= tr;
+      }
+    }
+    // Coalescence wobble (ぷるぷる): x/y pulse out of phase (volume-preserving)
+    if (this.osc > 0) {
+      const o = this.osc * Math.sin(this.oscPhase);
+      sx *= 1 + o; sy *= 1 - o;
     }
     const rx = r * sx, ry = r * sy;
     const rMax = Math.max(rx, ry);
@@ -637,7 +658,7 @@ class Droplet {
 }
 
 // ── Simulation ────────────────────────────────────────────────────────────────
-let droplets = [], trails = [];
+let droplets = [];
 
 function spawnAt(x, y, r) {
   if (r === undefined) {
@@ -705,39 +726,18 @@ function frame(ts) {
   for (const d of droplets) d.update(dt);
   processMerges();
 
-  // Cull dead; harvest trails
-  const alive = [];
-  for (const d of droplets) {
-    if (d.dead) {
-      if (d.falling && d.trailPts.length >= 4 && trails.length < CFG.maxTrails)
-        trails.push(new Trail(d.trailPts));
-    } else {
-      alive.push(d);
-    }
-  }
-  droplets = alive;
-
-  // Update trails; rebeading
-  const aliveT = [];
-  for (const t of trails) {
-    const beads = t.update(dt);
-    for (const b of beads) spawnAt(b.x, b.y, b.r);
-    if (!t.dead) aliveT.push(t);
-  }
-  trails = aliveT;
+  // Cull dead
+  droplets = droplets.filter(d => !d.dead);
 
   // ── Render ───────────────────────────────────────────────────────────────
   fadeSmallLayer(dt);
   drawBg();
 
   for (const s of streaks) { s.update(); s.draw(); }
-  // Dead trails (consume animation from top)
-  for (const t of trails)   t.draw();
-  // Live trails: grow progressively as the drop falls — never appears above current drop position
-  for (const d of droplets) {
-    if (d.falling && d.trailPts.length >= 1)
-      drawTrailSegs(d.trailPts, d.x, d.y);
-  }
+
+  // Short tails behind running drops (drawn before the drops themselves)
+  for (const d of droplets)
+    if (d.falling && d.vy > CFG.depositSpeedMin) drawTail(d);
 
   for (const d of droplets) if (!d.falling) d.draw();
   for (const d of droplets) if ( d.falling) d.draw();
@@ -864,7 +864,7 @@ function init() {
   resizeCanvases();
   updateBgCvs();
   streaks  = Array.from({ length: CFG.numStreaks }, () => new Streak(true));
-  droplets = []; trails = [];
+  droplets = [];
   for (let i = 0; i < 28; i++) randomSpawn();
 }
 
