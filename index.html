@@ -55,8 +55,8 @@ input[type=range]{width:100%;cursor:pointer;accent-color:#5aaed4}
 <div id="settingsBtn" title="設定">⚙</div>
 <div id="settingsPanel">
   <div class="srow">
-    <div class="slabel">最小サイズ<span id="minRVal">1.0</span></div>
-    <input type="range" id="minRSlider" min="0.5" max="3.0" step="0.1" value="1.0">
+    <div class="slabel">最小サイズ<span id="minRVal">1.8</span></div>
+    <input type="range" id="minRSlider" min="0.5" max="3.0" step="0.1" value="1.8">
   </div>
   <div class="srow">
     <div class="slabel">最大サイズ<span id="maxRVal">6.0</span></div>
@@ -219,7 +219,7 @@ canvas.addEventListener('drop', e => {
 // Live-wallpaper aesthetic: bias toward small, occasional large for drama
 const CFG = {
   spawnProb:      0.90,
-  minR:           1.0,
+  minR:           1.8,
   maxR:           6.0,
   fallThresh:     10,
   gravity:        0.22,
@@ -228,9 +228,25 @@ const CFG = {
   numStreaks:     16,
   refrMag:        1.65,
   gridCell:       28,
-  depositSpeedMin:2.8,   // vy above which a drop is "running" (sweeps / tails)
+  depositSpeedMin:2.8,   // speed above which a drop is "running" (draws a tail)
   depositInterval:4,
+  // Dotted "comet" trail: a big, fast drop sheds fine droplets along its path.
+  // Only drops at least trailMinR big AND moving at least trailMinSpeed do this.
+  trailMinR:      12,
+  trailMinSpeed:  7,
+  trailStep:      12,    // px between shed droplets
 };
+
+// Gravity direction as a UNIT vector. Right now it points straight down the
+// screen; later this will be driven live by the device accelerometer
+// (DeviceOrientation / DeviceMotion) so the rain runs toward real-world "down".
+// Everything gravity-related goes through GRAV — change it and the drops fall
+// that way. setGravity() normalises an arbitrary (ax,ay) into GRAV.
+const GRAV = { x: 0, y: 1 };
+function setGravity(ax, ay) {
+  const m = Math.hypot(ax, ay);
+  if (m > 1e-4) { GRAV.x = ax / m; GRAV.y = ay / m; }
+}
 
 // ── Default background ────────────────────────────────────────────────────────
 function drawDefaultBgTo(c) {
@@ -311,11 +327,16 @@ class SpatialGrid {
   }
   // Fills the caller-supplied array (reused across calls) to avoid per-frame
   // allocation churn / GC spikes when there are hundreds of drops.
+  // The search radius grows with this drop's size PLUS the largest drop on
+  // screen (gridMaxR), so a big drop touching this one is never missed even
+  // when its centre sits several cells away (fixes "touching but not merging").
   neighbors(d, out) {
     out.length = 0;
-    const cx = Math.floor(d.x/CFG.gridCell), cy = Math.floor(d.y/CFG.gridCell);
-    for (let dx = -1; dx <= 1; dx++)
-      for (let dy = -1; dy <= 1; dy++) {
+    const cell = CFG.gridCell;
+    const range = Math.min(4, 1 + Math.floor((d.r + gridMaxR) / cell));
+    const cx = Math.floor(d.x/cell), cy = Math.floor(d.y/cell);
+    for (let dx = -range; dx <= range; dx++)
+      for (let dy = -range; dy <= range; dy++) {
         const c = this.cells.get(`${cx+dx},${cy+dy}`);
         if (c) for (const i of c) out.push(i);
       }
@@ -440,7 +461,16 @@ class Droplet {
       // their top speed is higher — so they start slow and build up weightily.
       const massMul   = Math.max(0.55, 1 - excess * 0.02);
 
-      this.vy  = Math.min(this.vy * drag + CFG.gravity * gravMul * massMul * dt, vMax);
+      // Accelerate along the gravity vector. Velocity is split into the
+      // along-gravity component (gets drag + gravity + the speed cap) and the
+      // perpendicular component (wander / attraction). This already works for
+      // ANY GRAV direction — only the live accelerometer feed remains to add.
+      let vAlong = this.vx * GRAV.x + this.vy * GRAV.y;
+      const vpx = this.vx - vAlong * GRAV.x, vpy = this.vy - vAlong * GRAV.y;
+      vAlong = vAlong * drag + CFG.gravity * gravMul * massMul * dt;
+      if (vAlong > vMax) vAlong = vMax;
+      this.vx = vpx + vAlong * GRAV.x;
+      this.vy = vpy + vAlong * GRAV.y;
 
       // Meander: low-frequency lateral wander so the run isn't a straight line
       this.vx += (Math.sin(this.age * this.wanderF)
@@ -460,13 +490,32 @@ class Droplet {
 
       this.y  += this.vy * dt;
       this.x  += this.vx * dt;
-      this.vx *= Math.pow(0.93, dt);
+      // Damp only the perpendicular (sideways) drift, never the along-gravity
+      // fall — keeps this correct when GRAV is later tilted by the accelerometer.
+      const al = this.vx * GRAV.x + this.vy * GRAV.y;
+      let pxv = (this.vx - al * GRAV.x) * Math.pow(0.93, dt);
+      let pyv = (this.vy - al * GRAV.y) * Math.pow(0.93, dt);
+      this.vx = pxv + al * GRAV.x;
+      this.vy = pyv + al * GRAV.y;
 
-      // The running drop cleans its own path by absorbing the real drops it
-      // sweeps over (see the swept-absorption test in processMerges) — no
-      // separate wipe layer, so the trail comes out genuinely clean.
+      // A running drop cleans the mist it sweeps over (via absorption), but a
+      // big, fast one also sheds a dotted "comet" trail of fine droplets. These
+      // are dropped ~2r BEHIND the body so the sweep doesn't re-absorb them.
+      const speed = Math.hypot(this.vx, this.vy);
+      if (this.r >= CFG.trailMinR && speed >= CFG.trailMinSpeed) {
+        while (this.y - this.lastDepositY >= CFG.trailStep) {
+          this.lastDepositY += CFG.trailStep;
+          const off = (Math.random() - 0.5) * this.r * 0.7;
+          spawnAt(this.x + off, this.lastDepositY - this.r * 2.1, 1.1 + Math.random() * 1.6);
+        }
+      } else {
+        this.lastDepositY = this.y;
+      }
 
-      if (this.y - this.r > H) this.dead = true;
+      // Despawn once fully past the downstream screen edge (along gravity)
+      if ((GRAV.y > 0 && this.y - this.r > H) || (GRAV.y < 0 && this.y + this.r < 0) ||
+          (GRAV.x > 0 && this.x - this.r > W) || (GRAV.x < 0 && this.x + this.r < 0))
+        this.dead = true;
     }
 
     this.px = this.x; this.py = this.y;
@@ -508,13 +557,22 @@ class Droplet {
     const x = this.x, y = this.y;
 
     if (r < 3.2) {
-      // Tiny tracked drop: darken + tiny caustic, matching the small-drop look
+      // Tiny drop: read as a faint glass bead (rim + small highlight), not a
+      // solid dot — a very light body keeps it from looking like drizzle.
       ctx.beginPath();
       ctx.arc(x, y, r, 0, Math.PI * 2);
-      ctx.fillStyle = bgDark ? 'rgba(220,236,250,0.16)' : 'rgba(26,46,66,0.20)';
+      ctx.fillStyle = bgDark ? 'rgba(220,236,250,0.10)' : 'rgba(24,44,64,0.11)';
       ctx.fill();
-      ctx.strokeStyle = 'rgba(10,25,45,0.30)';
-      ctx.lineWidth = 0.45; ctx.stroke();
+      if (r > 1.6) {                       // tiny upper caustic highlight
+        ctx.beginPath();
+        ctx.arc(x - r * 0.2, y - r * 0.28, Math.max(0.5, r * 0.32), 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255,255,255,0.45)';
+        ctx.fill();
+      }
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(10,25,45,0.34)';
+      ctx.lineWidth = 0.5; ctx.stroke();
       return;
     }
 
@@ -606,16 +664,29 @@ function spawnAt(x, y, r) {
     const rnd = Math.pow(Math.random(), 2.4);
     r = CFG.minR + rnd * (CFG.maxR - CFG.minR);
   }
-  if (droplets.length >= CFG.maxDroplets) return;
   // Every spawn is a real, simulated drop now — even the tiny ones. They persist,
   // merge, grow and (if small and isolated) evaporate. No ephemeral bead layer.
+  if (droplets.length >= CFG.maxDroplets) {
+    // Don't hard-stop the rain at the cap: evict the smallest STATIC drop to
+    // make room (only if it's smaller than the newcomer, so we keep the
+    // interesting ones). This keeps rain always falling with gentle turnover.
+    let mi = -1, mr = Infinity;
+    for (let i = 0; i < droplets.length; i++) {
+      const d = droplets[i];
+      if (d.falling || d.r >= mr) continue;
+      mr = d.r; mi = i;
+    }
+    if (mi < 0 || mr >= r) return;   // nothing smaller to evict → skip this spawn
+    droplets[mi] = droplets[droplets.length - 1];
+    droplets.pop();
+  }
   droplets.push(new Droplet(x, y, r));
 }
 
 function randomSpawn() {
   const cx = CFG.maxR + Math.random() * (W - CFG.maxR * 2);
   const cy = CFG.maxR + Math.random() * (H - CFG.maxR * 2); // 画面全体
-  const n  = Math.random() < 0.58 ? 1 : Math.random() < 0.68 ? 2 : 3;
+  const n  = Math.random() < 0.80 ? 1 : Math.random() < 0.92 ? 2 : 3;
   for (let i = 0; i < n; i++) {
     const a = Math.random() * Math.PI * 2, d = Math.random() * 6;
     spawnAt(cx + Math.cos(a) * d, cy + Math.sin(a) * d);
@@ -638,10 +709,12 @@ function sweptHit(fast, o) {
 }
 
 const _nb = [];   // reused neighbour buffer
+let gridMaxR = 0; // largest drop radius this frame (sets neighbour search range)
 function processMerges() {
   grid.clear();
+  gridMaxR = 0;
   for (let i = 0; i < droplets.length; i++)
-    if (!droplets[i].dead) grid.insert(droplets[i], i);
+    if (!droplets[i].dead) { grid.insert(droplets[i], i); if (droplets[i].r > gridMaxR) gridMaxR = droplets[i].r; }
   for (let i = 0; i < droplets.length; i++) {
     if (droplets[i].dead) continue;
     grid.neighbors(droplets[i], _nb);
