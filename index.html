@@ -14,16 +14,14 @@ html,body{width:100%;height:100%;overflow:hidden;background:#1a2430}
 #small,#c{display:block;position:absolute;top:0;left:0;width:100%;height:100%;touch-action:none}
 #small{pointer-events:none}
 
-#fileBtn{
-  position:fixed;bottom:16px;right:16px;
-  width:42px;height:42px;border-radius:21px;
-  background:rgba(0,0,0,0.35);backdrop-filter:blur(6px);
-  border:1px solid rgba(255,255,255,0.22);
-  display:flex;align-items:center;justify-content:center;
-  cursor:pointer;font-size:18px;color:#fff;
+#fileIn{display:none}
+#bgBtn{
+  width:100%;padding:7px 0;border-radius:8px;
+  background:rgba(255,255,255,0.10);border:1px solid rgba(255,255,255,0.20);
+  color:#ddeef8;font:13px system-ui,sans-serif;cursor:pointer;
   -webkit-user-select:none;user-select:none;
 }
-#fileIn{display:none}
+#bgBtn:active{background:rgba(255,255,255,0.18)}
 
 #settingsBtn{
   position:fixed;bottom:16px;left:16px;
@@ -55,7 +53,6 @@ input[type=range]{width:100%;cursor:pointer;accent-color:#5aaed4}
 <body>
 <canvas id="c"></canvas>
 <canvas id="small"></canvas>
-<div id="fileBtn" title="背景を変更">🖼</div>
 <input id="fileIn" type="file" accept="image/*">
 <div id="settingsBtn" title="設定">⚙</div>
 <div id="settingsPanel">
@@ -70,6 +67,9 @@ input[type=range]{width:100%;cursor:pointer;accent-color:#5aaed4}
   <div class="srow">
     <div class="slabel">降雨強度<span id="spawnVal">中</span></div>
     <input type="range" id="spawnSlider" min="1" max="5" step="1" value="3">
+  </div>
+  <div class="srow">
+    <button id="bgBtn">🖼 背景を変更</button>
   </div>
 </div>
 
@@ -86,7 +86,7 @@ let W = 0, H = 0;
 
 // Small-drop layer fades each frame
 function fadeSmallLayer(dt) {
-  smallCtx.globalAlpha = Math.pow(0.968, dt);
+  smallCtx.globalAlpha = Math.pow(0.982, dt);
   smallCtx.globalCompositeOperation = 'destination-in';
   smallCtx.fillRect(0, 0, W, H);
   smallCtx.globalCompositeOperation = 'source-over';
@@ -97,7 +97,7 @@ function drawSmallDrop(x, y, r) {
   if (r < 0.4) return;
   smallCtx.beginPath();
   smallCtx.arc(x, y, r, 0, Math.PI * 2);
-  smallCtx.fillStyle = bgReady ? 'rgba(205,228,246,0.55)' : 'rgba(185,212,230,0.55)';
+  smallCtx.fillStyle = bgReady ? 'rgba(205,228,246,0.68)' : 'rgba(185,212,230,0.68)';
   smallCtx.fill();
   if (r > 1.2) {
     smallCtx.strokeStyle = 'rgba(18,42,68,0.26)';
@@ -128,7 +128,7 @@ function loadImg(src) {
   img.src = src;
 }
 
-document.getElementById('fileBtn').addEventListener('click', () =>
+document.getElementById('bgBtn').addEventListener('click', () =>
   document.getElementById('fileIn').click());
 document.getElementById('fileIn').addEventListener('change', e => {
   const f = e.target.files[0]; if (f) loadImg(URL.createObjectURL(f));
@@ -145,7 +145,7 @@ canvas.addEventListener('drop', e => {
 // On ~70mm-wide phone screen ≈ 5.6px/mm → r≈1.7-5.6px for typical raindrops
 // Live-wallpaper aesthetic: bias toward small, occasional large for drama
 const CFG = {
-  spawnProb:      0.12,
+  spawnProb:      0.90,
   minR:           1.0,
   maxR:           6.0,
   fallThresh:     10,
@@ -225,9 +225,9 @@ class Trail {
     const segPx = 4;
     const removeCount = Math.floor(this.consumed / segPx);
     for (let i = 0; i < Math.min(removeCount, this.segs.length); i++) {
-      if (Math.random() < CFG.beadProb)
-        beads.push({ x: this.segs[i].x + (Math.random() - 0.5) * 4, y: this.segs[i].y,
-                     r: 0.7 + Math.random() * 1.5 });
+      if (Math.random() < 0.42)
+        beads.push({ x: this.segs[i].x + (Math.random() - 0.5) * 5, y: this.segs[i].y,
+                     r: 2.2 + Math.random() * 2.8 });
     }
     if (removeCount > 0) {
       this.segs.splice(0, Math.min(removeCount, this.segs.length));
@@ -239,26 +239,30 @@ class Trail {
   draw() {
     if (this.segs.length < 2) return;
     ctx.save();
-    // Trail width based on the drop radius stored in w (w = r * 0.28)
     const w = this.segs[this.segs.length - 1].w;
-    const trailW = Math.max(3, w * 3.8);
+    const trailW = Math.max(4, w * 4.2);
     const buildPath = () => {
       ctx.beginPath();
       ctx.moveTo(this.segs[0].x, this.segs[0].y);
       for (let i = 1; i < this.segs.length; i++)
         ctx.lineTo(this.segs[i].x, this.segs[i].y);
     };
-    // Dome body — wide base (the sides of the kamaboko ridge)
-    buildPath();
-    ctx.lineWidth = trailW;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
-    ctx.strokeStyle = bgReady ? 'rgba(190,218,238,0.52)' : 'rgba(170,205,228,0.52)';
-    ctx.stroke();
-    // Dome highlight — narrow bright stripe down the crown
+    // Dark rim — sides of the kamaboko dome
     buildPath();
-    ctx.lineWidth = trailW * 0.38;
-    ctx.strokeStyle = 'rgba(235,250,255,0.72)';
+    ctx.lineWidth = trailW + 2;
+    ctx.strokeStyle = 'rgba(40,80,110,0.24)';
+    ctx.stroke();
+    // Water body — semi-transparent
+    buildPath();
+    ctx.lineWidth = trailW;
+    ctx.strokeStyle = bgReady ? 'rgba(195,222,240,0.40)' : 'rgba(175,207,228,0.40)';
+    ctx.stroke();
+    // Crown — wide and very faint brightening (not a sharp laser stripe)
+    buildPath();
+    ctx.lineWidth = trailW * 0.68;
+    ctx.strokeStyle = 'rgba(215,236,250,0.16)';
     ctx.stroke();
     ctx.restore();
   }
@@ -397,11 +401,15 @@ class Droplet {
         this.lastDepositY = this.y;
       }
 
-      // Record path for post-exit Trail (rebeading)
-      if (this.y - this.lastTY >= 4) {
-        this.trailPts.push({ x: this.x, y: this.lastTY + 2, w: this.r * 0.28 });
+      // Record trail only where drop is already fast — avoids trail appearing at fall start
+      if (this.vy > CFG.depositSpeedMin) {
+        if (this.y - this.lastTY >= 4) {
+          this.trailPts.push({ x: this.x, y: this.lastTY + 2, w: this.r * 0.28 });
+          this.lastTY = this.y;
+          if (this.trailPts.length > 200) this.trailPts.shift();
+        }
+      } else {
         this.lastTY = this.y;
-        if (this.trailPts.length > 200) this.trailPts.shift();
       }
 
       if (this.y - this.r > H) this.dead = true;
@@ -532,18 +540,28 @@ function processMerges() {
       else if (droplets[i].r >= droplets[j].r) droplets[i].absorb(droplets[j]);
       else                                     droplets[j].absorb(droplets[i]);
     }
-  }  
+  }
 }
 
 // ── Main loop ─────────────────────────────────────────────────────────────────
 let lastTs = 0;
 
+// Pause rendering when screen is off or app is backgrounded
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) { lastTs = 0; requestAnimationFrame(frame); }
+});
+
 function frame(ts) {
+  if (document.hidden) return; // screen off / minimized — stop drawing
   const dt = lastTs ? Math.min((ts - lastTs) / 16.667, 2.5) : 1;
   lastTs = ts;
 
-  if (droplets.length < CFG.maxDroplets && Math.random() < CFG.spawnProb * dt)
-    randomSpawn();
+  // Support spawnProb > 1 by spawning Math.floor(prob) times + fractional chance
+  if (droplets.length < CFG.maxDroplets) {
+    const st = CFG.spawnProb * dt;
+    const sn = Math.floor(st) + (Math.random() < (st % 1) ? 1 : 0);
+    for (let i = 0; i < sn; i++) randomSpawn();
+  }
 
   for (const d of droplets) d.update(dt);
   processMerges();
@@ -624,7 +642,7 @@ canvas.addEventListener('touchstart', () => {
 }, { passive: true });
 
 const spawnLabels = ['霧雨', '小雨', '中雨', '大雨', '豪雨'];
-const spawnProbs  = [0.08, 0.16, 0.32, 0.55, 0.90]; // 旧maxを中央(中雨)に
+const spawnProbs  = [0.20, 0.45, 0.90, 1.8, 3.5]; // 0.90を中央(中雨)に
 
 document.getElementById('minRSlider').addEventListener('input', e => {
   CFG.minR = parseFloat(e.target.value);
