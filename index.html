@@ -86,7 +86,7 @@ let W = 0, H = 0;
 
 // Small-drop layer fades each frame
 function fadeSmallLayer(dt) {
-  smallCtx.globalAlpha = Math.pow(0.982, dt);
+  smallCtx.globalAlpha = Math.pow(0.990, dt);
   smallCtx.globalCompositeOperation = 'destination-in';
   smallCtx.fillRect(0, 0, W, H);
   smallCtx.globalCompositeOperation = 'source-over';
@@ -97,13 +97,43 @@ function drawSmallDrop(x, y, r) {
   if (r < 0.4) return;
   smallCtx.beginPath();
   smallCtx.arc(x, y, r, 0, Math.PI * 2);
-  smallCtx.fillStyle = bgReady ? 'rgba(205,228,246,0.68)' : 'rgba(185,212,230,0.68)';
+  smallCtx.fillStyle = bgReady ? 'rgba(205,228,246,0.72)' : 'rgba(185,212,230,0.72)';
   smallCtx.fill();
   if (r > 1.2) {
     smallCtx.strokeStyle = 'rgba(18,42,68,0.26)';
     smallCtx.lineWidth = 0.4;
     smallCtx.stroke();
   }
+}
+
+// Draw a kamaboko water-ridge trail path (used for both live and dead trails)
+function drawTrailSegs(segs, extraX, extraY) {
+  const hasExtra = extraX !== undefined;
+  const totalPts = segs.length + (hasExtra ? 1 : 0);
+  if (totalPts < 2) return;
+  const r = segs[segs.length - 1].r;
+  const trailW = Math.max(2, r * 0.38);
+  const buildPath = () => {
+    ctx.beginPath();
+    ctx.moveTo(segs[0].x, segs[0].y);
+    for (let i = 1; i < segs.length; i++) ctx.lineTo(segs[i].x, segs[i].y);
+    if (hasExtra) ctx.lineTo(extraX, extraY);
+  };
+  ctx.save();
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  buildPath();
+  ctx.lineWidth = trailW + 1;
+  ctx.strokeStyle = 'rgba(40,80,110,0.18)';
+  ctx.stroke();
+  buildPath();
+  ctx.lineWidth = trailW;
+  ctx.strokeStyle = bgReady ? 'rgba(195,222,240,0.42)' : 'rgba(175,207,228,0.42)';
+  ctx.stroke();
+  buildPath();
+  ctx.lineWidth = trailW * 0.40;
+  ctx.strokeStyle = 'rgba(220,240,255,0.20)';
+  ctx.stroke();
+  ctx.restore();
 }
 
 // ── Background ────────────────────────────────────────────────────────────────
@@ -211,17 +241,16 @@ class Streak {
 }
 let streaks = [];
 
-// ── Trail (water ridge that beads up after drop exits) ───────────────────────
+// ── Trail (water mark that beads up after drop exits) ─────────────────────────
 class Trail {
   constructor(pts) {
-    this.segs = pts.map(p => ({ x: p.x, y: p.y, w: p.w }));
+    this.segs = pts.map(p => ({ x: p.x, y: p.y, r: p.r }));
     this.dead = false;
     this.consumed = 0; // px consumed from the top (oldest) end
   }
   update(dt) {
     const beads = [];
     this.consumed += CFG.trailConsumeSpeed * dt;
-    // Each recorded segment is ~4px apart; remove whole segments as consumed advances
     const segPx = 4;
     const removeCount = Math.floor(this.consumed / segPx);
     for (let i = 0; i < Math.min(removeCount, this.segs.length); i++) {
@@ -236,36 +265,7 @@ class Trail {
     this.dead = this.segs.length < 2;
     return beads;
   }
-  draw() {
-    if (this.segs.length < 2) return;
-    ctx.save();
-    const w = this.segs[this.segs.length - 1].w;
-    const trailW = Math.max(4, w * 4.2);
-    const buildPath = () => {
-      ctx.beginPath();
-      ctx.moveTo(this.segs[0].x, this.segs[0].y);
-      for (let i = 1; i < this.segs.length; i++)
-        ctx.lineTo(this.segs[i].x, this.segs[i].y);
-    };
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    // Dark rim — sides of the kamaboko dome
-    buildPath();
-    ctx.lineWidth = trailW + 2;
-    ctx.strokeStyle = 'rgba(40,80,110,0.24)';
-    ctx.stroke();
-    // Water body — semi-transparent
-    buildPath();
-    ctx.lineWidth = trailW;
-    ctx.strokeStyle = bgReady ? 'rgba(195,222,240,0.40)' : 'rgba(175,207,228,0.40)';
-    ctx.stroke();
-    // Crown — wide and very faint brightening (not a sharp laser stripe)
-    buildPath();
-    ctx.lineWidth = trailW * 0.68;
-    ctx.strokeStyle = 'rgba(215,236,250,0.16)';
-    ctx.stroke();
-    ctx.restore();
-  }
+  draw() { drawTrailSegs(this.segs); }
 }
 
 // ── Spatial grid ──────────────────────────────────────────────────────────────
@@ -404,7 +404,7 @@ class Droplet {
       // Record trail only where drop is already fast — avoids trail appearing at fall start
       if (this.vy > CFG.depositSpeedMin) {
         if (this.y - this.lastTY >= 4) {
-          this.trailPts.push({ x: this.x, y: this.lastTY + 2, w: this.r * 0.28 });
+          this.trailPts.push({ x: this.x, y: this.lastTY + 2, r: this.r });
           this.lastTY = this.y;
           if (this.trailPts.length > 200) this.trailPts.shift();
         }
@@ -433,8 +433,6 @@ class Droplet {
       sy = Math.max(0.78, 1 / (sx * 1.06));
     }
     const rx = r * sx, ry = r * sy;
-
-    // No live trail lines drawn here — fast drops deposit via drawSmallDrop
 
     if (r < 3.2) {
       ctx.beginPath();
@@ -592,7 +590,13 @@ function frame(ts) {
   drawBg();
 
   for (const s of streaks) { s.update(); s.draw(); }
+  // Dead trails (consume animation from top)
   for (const t of trails)   t.draw();
+  // Live trails: grow progressively as the drop falls — never appears above current drop position
+  for (const d of droplets) {
+    if (d.falling && d.trailPts.length >= 1)
+      drawTrailSegs(d.trailPts, d.x, d.y);
+  }
 
   for (const d of droplets) if (!d.falling) d.draw();
   for (const d of droplets) if ( d.falling) d.draw();
