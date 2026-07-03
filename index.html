@@ -84,6 +84,33 @@ const smallCtx = smallCvs.getContext('2d');
 const SMALL_R  = 5.5;  // tracked threshold
 let W = 0, H = 0;
 
+// ── Debug HUD / test backgrounds (only when URL contains #debug) ───────────────
+const DEBUG = location.hash.indexOf('debug') !== -1;
+let testBgMode = 0;               // 0 normal · 1 stripes · 2 checker · 3 white
+let hudEl = null, frameT0 = 0;
+const fpsBuf = [], msBuf = [];
+if (DEBUG) {
+  hudEl = document.createElement('div');
+  hudEl.style.cssText =
+    'position:fixed;top:8px;right:8px;z-index:99;padding:6px 9px;'
+    + 'background:rgba(0,0,0,0.62);color:#9f9;font:11px/1.45 monospace;'
+    + 'border-radius:6px;pointer-events:none;white-space:pre';
+  document.body.appendChild(hudEl);
+}
+function updateHud(dt) {
+  const ms = performance.now() - frameT0;
+  msBuf.push(ms);  if (msBuf.length  > 60) msBuf.shift();
+  fpsBuf.push(60 / dt); if (fpsBuf.length > 60) fpsBuf.shift();
+  const avg = a => a.reduce((s, v) => s + v, 0) / a.length;
+  const mx  = a => a.reduce((s, v) => Math.max(s, v), 0);
+  const modes = ['normal', 'stripes', 'checker', 'white'];
+  hudEl.textContent =
+    `FPS ${avg(fpsBuf).toFixed(0)}\n` +
+    `ms  ${avg(msBuf).toFixed(1)} / max ${mx(msBuf).toFixed(1)}\n` +
+    `drops ${droplets.length}  trails ${trails.length}\n` +
+    `bg ${bgDark ? 'dark' : 'light'}${bgHasImg ? ' img' : ''}  test ${modes[testBgMode]}`;
+}
+
 // Small-drop layer fades each frame
 function fadeSmallLayer(dt) {
   smallCtx.globalAlpha = Math.pow(0.990, dt);
@@ -95,13 +122,25 @@ function fadeSmallLayer(dt) {
 
 function drawSmallDrop(x, y, r) {
   if (r < 0.4) return;
+  // A water bead is transparent: it slightly DARKENS/distorts the background and
+  // carries a tiny bright caustic point — never a flat blue disc.
   smallCtx.beginPath();
   smallCtx.arc(x, y, r, 0, Math.PI * 2);
-  smallCtx.fillStyle = bgReady ? 'rgba(205,228,246,0.72)' : 'rgba(185,212,230,0.72)';
+  smallCtx.fillStyle = bgDark ? 'rgba(220,236,250,0.16)' : 'rgba(26,46,66,0.18)';
   smallCtx.fill();
+  // Caustic: a small off-centre highlight where the lens focuses light
+  if (r > 0.8) {
+    smallCtx.beginPath();
+    smallCtx.arc(x - r * 0.16, y - r * 0.16, Math.max(0.5, r * 0.3), 0, Math.PI * 2);
+    smallCtx.fillStyle = 'rgba(255,255,255,0.50)';
+    smallCtx.fill();
+  }
+  // Thin dark rim
   if (r > 1.2) {
-    smallCtx.strokeStyle = 'rgba(18,42,68,0.26)';
-    smallCtx.lineWidth = 0.4;
+    smallCtx.beginPath();
+    smallCtx.arc(x, y, r, 0, Math.PI * 2);
+    smallCtx.strokeStyle = 'rgba(8,24,44,0.30)';
+    smallCtx.lineWidth = 0.5;
     smallCtx.stroke();
   }
 }
@@ -127,7 +166,7 @@ function drawTrailSegs(segs, extraX, extraY) {
   ctx.stroke();
   buildPath();
   ctx.lineWidth = trailW;
-  ctx.strokeStyle = bgReady ? 'rgba(195,222,240,0.42)' : 'rgba(175,207,228,0.42)';
+  ctx.strokeStyle = bgHasImg ? 'rgba(195,222,240,0.42)' : 'rgba(175,207,228,0.42)';
   ctx.stroke();
   buildPath();
   ctx.lineWidth = trailW * 0.40;
@@ -137,19 +176,69 @@ function drawTrailSegs(segs, extraX, extraY) {
 }
 
 // ── Background ────────────────────────────────────────────────────────────────
-let bgImg = null, bgCvs = null, bgCtx2 = null, bgReady = false;
+// bgCvs always holds a full-screen copy of the current background so that drops
+// can refract it — this is true even for the default (no-image) background.
+//   bgReady  = bgCvs is a valid full-screen source to sample
+//   bgHasImg = the user supplied a photo (drives colour choices)
+//   bgDark   = the background is dark on average (drives bead visibility)
+let bgImg = null, bgCvs = null, bgCtx2 = null;
+let bgReady = false, bgHasImg = false, bgDark = false;
+
+function ensureBgCvs() {
+  bgCvs  = bgCvs  || document.createElement('canvas');
+  bgCtx2 = bgCtx2 || bgCvs.getContext('2d', { willReadFrequently: true });
+  bgCvs.width = W; bgCvs.height = H;
+}
+
+// Average luminance of bgCvs → bgDark (sparse sample, runs once per bg change)
+function computeBgDark() {
+  try {
+    const d = bgCtx2.getImageData(0, 0, bgCvs.width, bgCvs.height).data;
+    const step = Math.max(4, Math.floor(d.length / 4 / 2000)) * 4;
+    let sum = 0, n = 0;
+    for (let i = 0; i < d.length; i += step) {
+      sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]; n++;
+    }
+    bgDark = n > 0 && sum / n < 100;
+  } catch (e) { bgDark = false; }
+}
 
 function updateBgCvs() {
-  if (!bgImg || !W) return;
-  bgCvs  = bgCvs  || document.createElement('canvas');
-  bgCtx2 = bgCtx2 || bgCvs.getContext('2d');
-  bgCvs.width = W; bgCvs.height = H;
+  if (!bgImg || !W) { if (!bgImg) buildDefaultBgCvs(); return; }
+  ensureBgCvs();
   const sc = Math.max(W / bgImg.naturalWidth, H / bgImg.naturalHeight);
   const bw = bgImg.naturalWidth * sc, bh = bgImg.naturalHeight * sc;
   try { bgCtx2.filter = 'blur(1px)'; } catch(e) {}
   bgCtx2.drawImage(bgImg, (W - bw) / 2, (H - bh) / 2, bw, bh);
   bgCtx2.filter = 'none';
-  bgReady = true;
+  bgReady = true; bgHasImg = true;
+  computeBgDark();
+}
+
+// Render the default gradient into bgCvs so it can be refracted like a photo
+function buildDefaultBgCvs() {
+  if (!W) return;
+  ensureBgCvs();
+  drawDefaultBgTo(bgCtx2);
+  bgReady = true; bgHasImg = false; bgDark = false;
+}
+
+// Debug: swap bgCvs for a test pattern (stripes/checker/white) to inspect refraction
+function applyTestBg() {
+  if (testBgMode === 0) { if (bgImg) updateBgCvs(); else buildDefaultBgCvs(); return; }
+  ensureBgCvs();
+  const c = bgCtx2;
+  c.fillStyle = '#fff'; c.fillRect(0, 0, W, H);
+  if (testBgMode === 1) {                       // vertical stripes, 20px bars
+    c.fillStyle = '#111';
+    for (let x = 0; x < W; x += 40) c.fillRect(x, 0, 20, H);
+  } else if (testBgMode === 2) {                // 40px checkerboard
+    c.fillStyle = '#111';
+    for (let y = 0; y < H; y += 40)
+      for (let x = 0; x < W; x += 40)
+        if (((x / 40 + y / 40) & 1)) c.fillRect(x, y, 40, 40);
+  }                                              // testBgMode === 3 → plain white
+  bgReady = true; bgDark = false;
 }
 
 function loadImg(src) {
@@ -195,24 +284,45 @@ const CFG = {
 };
 
 // ── Default background ────────────────────────────────────────────────────────
-function drawDefaultBg() {
-  const g = ctx.createLinearGradient(0, 0, W * 0.4, H);
+function drawDefaultBgTo(c) {
+  const g = c.createLinearGradient(0, 0, W * 0.4, H);
   g.addColorStop(0,    '#bccbd4');
   g.addColorStop(0.45, '#cad8e2');
   g.addColorStop(1,    '#a8bfc9');
-  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  c.fillStyle = g; c.fillRect(0, 0, W, H);
   for (let i = 0; i < 5; i++) {
     const yc = H * (0.1 + i * 0.18);
-    const g2 = ctx.createLinearGradient(0, yc - 55, 0, yc + 55);
+    const g2 = c.createLinearGradient(0, yc - 55, 0, yc + 55);
     g2.addColorStop(0,   'rgba(255,255,255,0)');
     g2.addColorStop(0.5, 'rgba(255,255,255,0.07)');
     g2.addColorStop(1,   'rgba(255,255,255,0)');
-    ctx.fillStyle = g2; ctx.fillRect(0, yc - 55, W, 110);
+    c.fillStyle = g2; c.fillRect(0, yc - 55, W, 110);
   }
 }
 function drawBg() {
   if (bgReady && bgCvs) ctx.drawImage(bgCvs, 0, 0);
-  else drawDefaultBg();
+  else drawDefaultBgTo(ctx);
+}
+
+// Non-linear (lens-like) refraction for large drops: the background is sampled at
+// a low magnification in the centre and progressively higher toward the rim, so
+// the edge compresses the image like a real water lens. Rings are drawn outer→
+// inner; each inner disc overdraws the previous one, so the visible magnification
+// steps up as you move outward. Must be called INSIDE the drop's clip.
+const RING_FRAC = [1.00, 0.72, 0.48, 0.26];
+const RING_MAG  = [2.15, 1.75, 1.42, 1.18];
+function refractRings(x, y, rx, ry) {
+  for (let k = 0; k < RING_FRAC.length; k++) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.ellipse(x, y, rx * RING_FRAC[k], ry * RING_FRAC[k], 0, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.translate(x, y);
+    ctx.scale(-RING_MAG[k], -RING_MAG[k]);   // negative = inverted (倒立) lens image
+    ctx.translate(-x, -y);
+    ctx.drawImage(bgCvs, 0, 0);
+    ctx.restore();
+  }
 }
 
 // ── Rain streaks ──────────────────────────────────────────────────────────────
@@ -233,7 +343,7 @@ class Streak {
     ctx.beginPath();
     ctx.moveTo(this.x, this.y);
     ctx.lineTo(this.x + this.len * 0.1, this.y + this.len);
-    ctx.strokeStyle = bgReady
+    ctx.strokeStyle = bgHasImg
       ? `rgba(255,255,255,${this.a})`
       : `rgba(160,195,220,${this.a})`;
     ctx.lineWidth = 0.6; ctx.stroke();
@@ -433,63 +543,93 @@ class Droplet {
       sy = Math.max(0.78, 1 / (sx * 1.06));
     }
     const rx = r * sx, ry = r * sy;
+    const rMax = Math.max(rx, ry);
+    const x = this.x, y = this.y;
 
     if (r < 3.2) {
+      // Tiny tracked drop: darken + tiny caustic, matching the small-drop look
       ctx.beginPath();
-      ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
-      ctx.fillStyle = bgReady ? 'rgba(210,228,242,0.52)' : 'rgba(190,215,230,0.52)';
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fillStyle = bgDark ? 'rgba(220,236,250,0.16)' : 'rgba(26,46,66,0.20)';
       ctx.fill();
-      ctx.strokeStyle = 'rgba(30,55,80,0.28)';
+      ctx.strokeStyle = 'rgba(10,25,45,0.30)';
       ctx.lineWidth = 0.45; ctx.stroke();
       return;
     }
 
     const isEllipse = Math.abs(sx - 1) > 0.02 || Math.abs(sy - 1) > 0.02;
+    const ringPath = () => {
+      ctx.beginPath();
+      if (isEllipse) ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
+      else           ctx.arc(x, y, r, 0, Math.PI * 2);
+    };
 
-    ctx.save();
-    ctx.beginPath();
-    if (isEllipse) ctx.ellipse(this.x, this.y, rx, ry, 0, 0, Math.PI * 2);
-    else           ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
-    ctx.clip();
-
-    // Refraction
-    if (bgReady && bgCvs) {
-      ctx.save();
-      ctx.translate(this.x, this.y);
-      ctx.scale(-CFG.refrMag, -CFG.refrMag);
-      ctx.translate(-this.x, -this.y);
-      ctx.drawImage(bgCvs, 0, 0);
-      ctx.restore();
-    } else {
-      ctx.fillStyle = 'rgba(210,228,242,0.78)';
-      ctx.fillRect(this.x - rx, this.y - ry, rx * 2, ry * 2);
+    // Contact shadow: the lens steals light from just outside its rim (P1-4)
+    if (r >= 10 && bgHasImg) {
+      const og = ctx.createRadialGradient(x, y, rMax * 1.02, x, y, rMax * 1.28);
+      og.addColorStop(0, 'rgba(0,0,0,0.10)');
+      og.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = og;
+      ctx.fillRect(x - rMax * 1.3, y - rMax * 1.3, rMax * 2.6, rMax * 2.6);
     }
 
-    // Edge darkening
-    const rMax = Math.max(rx, ry);
-    const eg = ctx.createRadialGradient(this.x, this.y, rMax * 0.50, this.x, this.y, rMax);
-    eg.addColorStop(0, 'rgba(0,0,0,0)');
-    eg.addColorStop(1, 'rgba(0,0,0,0.26)');
-    ctx.fillStyle = eg;
-    ctx.fillRect(this.x - rx, this.y - ry, rx * 2, ry * 2);
+    ctx.save();
+    ringPath();
+    ctx.clip();
 
-    // Specular crescent
-    const sp = ctx.createRadialGradient(
-      this.x - rx * 0.28, this.y - ry * 0.34, 0,
-      this.x - rx * 0.07, this.y - ry * 0.10, rMax * 0.58
-    );
-    sp.addColorStop(0,    'rgba(255,255,255,0.70)');
-    sp.addColorStop(0.38, 'rgba(255,255,255,0.18)');
-    sp.addColorStop(1,    'rgba(255,255,255,0)');
-    ctx.fillStyle = sp;
-    ctx.fillRect(this.x - rx, this.y - ry, rx * 2, ry * 2);
+    // Refraction — non-linear (lens) for big drops, single-pass for smaller
+    if (bgReady && bgCvs) {
+      if (r >= 10) {
+        refractRings(x, y, rx, ry);
+      } else {
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.scale(-CFG.refrMag, -CFG.refrMag);
+        ctx.translate(-x, -y);
+        ctx.drawImage(bgCvs, 0, 0);
+        ctx.restore();
+      }
+    } else {
+      const dg = ctx.createRadialGradient(x, y, 0, x, y, rMax);
+      dg.addColorStop(0, 'rgba(20,40,60,0.10)');
+      dg.addColorStop(1, 'rgba(20,40,60,0.22)');
+      ctx.fillStyle = dg;
+      ctx.fillRect(x - rx, y - ry, rx * 2, ry * 2);
+    }
 
+    // Caustic: light focuses just below centre (subtle) (P1-4)
+    if (r >= 10) {
+      const cg = ctx.createRadialGradient(x, y + ry * 0.15, 0, x, y + ry * 0.15, rMax * 0.38);
+      cg.addColorStop(0, 'rgba(255,255,255,0.12)');
+      cg.addColorStop(1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = cg;
+      ctx.fillRect(x - rx, y - ry, rx * 2, ry * 2);
+    }
+
+    // Dark rim — concentrated in the outer 15% only; inside stays clear (P1-2)
+    const rimG = ctx.createRadialGradient(x, y, rMax * 0.80, x, y, rMax);
+    rimG.addColorStop(0,   'rgba(0,10,24,0)');
+    rimG.addColorStop(0.7, 'rgba(0,10,24,0.10)');
+    rimG.addColorStop(1,   'rgba(0,10,24,0.40)');
+    ctx.fillStyle = rimG;
+    ctx.fillRect(x - rx, y - ry, rx * 2, ry * 2);
+
+    // Specular highlight — small, sharp, always upper (light source = the sky) (P1-2)
+    const hx = x, hy = y - ry * 0.42, hlr = rMax * 0.34;
+    const hg = ctx.createRadialGradient(hx, hy, 0, hx, hy, hlr);
+    hg.addColorStop(0,   'rgba(255,255,255,0.90)');
+    hg.addColorStop(0.5, 'rgba(255,255,255,0.32)');
+    hg.addColorStop(1,   'rgba(255,255,255,0)');
+    ctx.save();
+    ctx.translate(hx, hy); ctx.scale(1, 0.6); ctx.translate(-hx, -hy);  // wide-not-tall
+    ctx.fillStyle = hg;
+    ctx.beginPath(); ctx.arc(hx, hy, hlr, 0, Math.PI * 2); ctx.fill();
     ctx.restore();
 
+    ctx.restore();  // end clip
+
     // Dark ring border
-    ctx.beginPath();
-    if (isEllipse) ctx.ellipse(this.x, this.y, rx, ry, 0, 0, Math.PI * 2);
-    else           ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
+    ringPath();
     ctx.strokeStyle = 'rgba(0,12,28,0.40)';
     ctx.lineWidth   = Math.max(0.6, r * 0.052);
     ctx.stroke();
@@ -551,6 +691,7 @@ document.addEventListener('visibilitychange', () => {
 
 function frame(ts) {
   if (document.hidden) return; // screen off / minimized — stop drawing
+  if (DEBUG) frameT0 = performance.now();
   const dt = lastTs ? Math.min((ts - lastTs) / 16.667, 2.5) : 1;
   lastTs = ts;
 
@@ -613,6 +754,8 @@ function frame(ts) {
   vg.addColorStop(1, 'rgba(0,0,0,0.30)');
   ctx.fillStyle = vg; ctx.fillRect(0, 0, W, H);
 
+  if (DEBUG) updateHud(dt);
+
   requestAnimationFrame(frame);
 }
 
@@ -661,6 +804,21 @@ document.getElementById('spawnSlider').addEventListener('input', e => {
   CFG.spawnProb = spawnProbs[v];
   document.getElementById('spawnVal').textContent = spawnLabels[v];
 });
+
+// Debug-only: cycle test backgrounds (normal → stripes → checker → white)
+if (DEBUG) {
+  const row = document.createElement('div');
+  row.className = 'srow';
+  const b = document.createElement('button');
+  b.textContent = '🧪 テスト背景';
+  b.style.cssText =
+    'width:100%;padding:7px 0;border-radius:8px;background:rgba(255,255,255,0.10);'
+    + 'border:1px solid rgba(255,255,255,0.20);color:#ddeef8;'
+    + 'font:13px system-ui,sans-serif;cursor:pointer';
+  b.addEventListener('click', () => { testBgMode = (testBgMode + 1) % 4; applyTestBg(); });
+  row.appendChild(b);
+  settingsPanel.appendChild(row);
+}
 
 // ── Input ─────────────────────────────────────────────────────────────────────
 function onPointer(e) {
@@ -712,7 +870,8 @@ function init() {
 
 window.addEventListener('resize', () => {
   resizeCanvases();
-  updateBgCvs();
+  if (DEBUG && testBgMode > 0) applyTestBg();
+  else                         updateBgCvs();
   streaks = Array.from({ length: CFG.numStreaks }, () => new Streak(true));
 });
 
