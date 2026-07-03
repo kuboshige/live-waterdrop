@@ -11,8 +11,7 @@
 <style>
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 html,body{width:100%;height:100%;overflow:hidden;background:#1a2430}
-#small,#c{display:block;position:absolute;top:0;left:0;width:100%;height:100%;touch-action:none}
-#small{pointer-events:none}
+#c{display:block;position:absolute;top:0;left:0;width:100%;height:100%;touch-action:none}
 
 #fileIn{display:none}
 #bgBtn{
@@ -52,7 +51,6 @@ input[type=range]{width:100%;cursor:pointer;accent-color:#5aaed4}
 </head>
 <body>
 <canvas id="c"></canvas>
-<canvas id="small"></canvas>
 <input id="fileIn" type="file" accept="image/*">
 <div id="settingsBtn" title="設定">⚙</div>
 <div id="settingsPanel">
@@ -79,9 +77,6 @@ input[type=range]{width:100%;cursor:pointer;accent-color:#5aaed4}
 // ── Canvas ────────────────────────────────────────────────────────────────────
 const canvas   = document.getElementById('c');
 const ctx      = canvas.getContext('2d');
-const smallCvs = document.getElementById('small');
-const smallCtx = smallCvs.getContext('2d');
-const SMALL_R  = 5.5;  // tracked threshold
 let W = 0, H = 0;
 
 // ── Debug HUD / test backgrounds (only when URL contains #debug) ───────────────
@@ -109,40 +104,6 @@ function updateHud(dt) {
     `ms  ${avg(msBuf).toFixed(1)} / max ${mx(msBuf).toFixed(1)}\n` +
     `drops ${droplets.length}\n` +
     `bg ${bgDark ? 'dark' : 'light'}${bgHasImg ? ' img' : ''}  test ${modes[testBgMode]}`;
-}
-
-// Small-drop layer fades each frame
-function fadeSmallLayer(dt) {
-  smallCtx.globalAlpha = Math.pow(0.990, dt);
-  smallCtx.globalCompositeOperation = 'destination-in';
-  smallCtx.fillRect(0, 0, W, H);
-  smallCtx.globalCompositeOperation = 'source-over';
-  smallCtx.globalAlpha = 1;
-}
-
-function drawSmallDrop(x, y, r) {
-  if (r < 0.4) return;
-  // A water bead is transparent: it slightly DARKENS/distorts the background and
-  // carries a tiny bright caustic point — never a flat blue disc.
-  smallCtx.beginPath();
-  smallCtx.arc(x, y, r, 0, Math.PI * 2);
-  smallCtx.fillStyle = bgDark ? 'rgba(220,236,250,0.16)' : 'rgba(26,46,66,0.18)';
-  smallCtx.fill();
-  // Caustic: a small off-centre highlight where the lens focuses light
-  if (r > 0.8) {
-    smallCtx.beginPath();
-    smallCtx.arc(x - r * 0.16, y - r * 0.16, Math.max(0.5, r * 0.3), 0, Math.PI * 2);
-    smallCtx.fillStyle = 'rgba(255,255,255,0.50)';
-    smallCtx.fill();
-  }
-  // Thin dark rim
-  if (r > 1.2) {
-    smallCtx.beginPath();
-    smallCtx.arc(x, y, r, 0, Math.PI * 2);
-    smallCtx.strokeStyle = 'rgba(8,24,44,0.30)';
-    smallCtx.lineWidth = 0.5;
-    smallCtx.stroke();
-  }
 }
 
 // Hydrophobic surface: a running drop leaves NO lasting ridge — only a short,
@@ -263,7 +224,7 @@ const CFG = {
   fallThresh:     10,
   gravity:        0.22,
   maxSpeed:       22,
-  maxDroplets:    500,
+  maxDroplets:    360,
   numStreaks:     16,
   refrMag:        1.65,
   gridCell:       28,
@@ -348,9 +309,11 @@ class SpatialGrid {
     let c = this.cells.get(k); if (!c) { c = []; this.cells.set(k, c); }
     c.push(i);
   }
-  neighbors(d) {
+  // Fills the caller-supplied array (reused across calls) to avoid per-frame
+  // allocation churn / GC spikes when there are hundreds of drops.
+  neighbors(d, out) {
+    out.length = 0;
     const cx = Math.floor(d.x/CFG.gridCell), cy = Math.floor(d.y/CFG.gridCell);
-    const out = [];
     for (let dx = -1; dx <= 1; dx++)
       for (let dy = -1; dy <= 1; dy++) {
         const c = this.cells.get(`${cx+dx},${cy+dy}`);
@@ -403,7 +366,8 @@ class Droplet {
                 : o.impact > 0 ? 1 + o.impact * 0.22 : 1;
     const oEff  = o.r * oSx * (1 + o.impact * 0.45);
 
-    const rr = (myEff + oEff) * 0.88;
+    // Merge as soon as the rims touch (edges in contact) — a touch eager (1.02)
+    const rr = (myEff + oEff) * 1.02;
     return dx * dx + dy * dy < rr * rr;
   }
 
@@ -418,13 +382,15 @@ class Droplet {
     }
     this.r   = Math.cbrt(vt);
     this.ttl = Infinity;
-    // Coalescence oscillation: surface tension makes the merged drop wobble.
-    // Amplitude grows with how much (relatively) was just swallowed; larger
-    // drops wobble slower (Rayleigh f ∝ 1/√r³).
-    const grew = v2 / vt;                       // fraction of new volume absorbed
-    this.osc      = Math.min(0.26, this.osc + 0.10 + grew * 0.45);
-    this.oscPhase = 0;
-    this.oscFreq  = (Math.PI * 2) / (14 + this.r * 0.7);
+    // Coalescence wobble ("ぷるん"). Only drops big enough to be perceptible (and
+    // that might eventually run) wobble visibly — tiny drops physically settle
+    // faster than the eye can follow, so we skip it entirely for them.
+    if (this.r >= 6) {
+      const grew = v2 / vt;                     // fraction of new volume absorbed
+      this.osc      = Math.min(0.38, this.osc + 0.18 + grew * 0.55);
+      this.oscPhase = 0;
+      this.oscFreq  = (Math.PI * 2) / (6 + this.r * 0.25);  // bigger = a bit slower
+    }
     if (o.vy > this.vy) this.vy = o.vy * 0.45;
     o.dead = true;
   }
@@ -433,6 +399,7 @@ class Droplet {
     if (this.ttl !== Infinity) {
       this.ttl -= dt;
       if (this.ttl <= 0) { this.dead = true; return; }
+      if (this.ttl < 45) this.r *= Math.pow(0.96, dt); // evaporate away smoothly
     }
 
     this.age += dt;
@@ -440,10 +407,10 @@ class Droplet {
     if (this.bump     > 0) this.bump     = Math.max(0, this.bump     - 0.012 * dt);
     if (this.vibTimer > 0) this.vibTimer = Math.max(0, this.vibTimer - dt);
 
-    // Coalescence oscillation decay (~0.3s to settle)
-    if (this.osc > 0.003) {
+    // Coalescence wobble decay — settles fast (~0.15s), a couple of quick bounces
+    if (this.osc > 0.004) {
       this.oscPhase += this.oscFreq * dt;
-      this.osc      *= Math.pow(0.89, dt);
+      this.osc      *= Math.pow(0.85, dt);
     } else {
       this.osc = 0;
     }
@@ -495,36 +462,9 @@ class Droplet {
       this.x  += this.vx * dt;
       this.vx *= Math.pow(0.93, dt);
 
-      // Hydrophobic sweep: wipe the small-drop layer clean along the path, and
-      // occasionally leave a tiny satellite bead beside it or a torn bead behind.
-      if (this.vy > CFG.depositSpeedMin) {
-        smallCtx.save();
-        smallCtx.globalCompositeOperation = 'destination-out';
-        smallCtx.strokeStyle = 'rgba(0,0,0,1)';
-        smallCtx.lineCap = 'round';
-        smallCtx.lineWidth = this.r * 1.9;
-        smallCtx.beginPath();
-        smallCtx.moveTo(this.px, this.py);
-        smallCtx.lineTo(this.x, this.y);
-        smallCtx.stroke();
-        smallCtx.restore();
-
-        const dist = this.y - this.lastDepositY;
-        if (dist >= CFG.depositInterval) {
-          if (Math.random() < 0.15) {            // satellite beside the wiped path
-            const side = Math.random() < 0.5 ? -1 : 1;
-            drawSmallDrop(this.x + side * (0.9 + Math.random() * 0.6) * this.r,
-                          this.lastDepositY + dist * Math.random(),
-                          0.5 + Math.random() * 1.1);
-          }
-          if (sticking && Math.random() < 0.10)  // torn bead when it hitches
-            drawSmallDrop(this.x + (Math.random() - 0.5) * this.r * 0.6,
-                          this.y - this.r * 0.9, 1.0 + Math.random() * 1.4);
-          this.lastDepositY = this.y;
-        }
-      } else {
-        this.lastDepositY = this.y;
-      }
+      // The running drop cleans its own path by absorbing the real drops it
+      // sweeps over (see the swept-absorption test in processMerges) — no
+      // separate wipe layer, so the trail comes out genuinely clean.
 
       if (this.y - this.r > H) this.dead = true;
     }
@@ -666,11 +606,9 @@ function spawnAt(x, y, r) {
     const rnd = Math.pow(Math.random(), 2.4);
     r = CFG.minR + rnd * (CFG.maxR - CFG.minR);
   }
-  if (r < SMALL_R) {
-    drawSmallDrop(x, y, r);
-    return;
-  }
   if (droplets.length >= CFG.maxDroplets) return;
+  // Every spawn is a real, simulated drop now — even the tiny ones. They persist,
+  // merge, grow and (if small and isolated) evaporate. No ephemeral bead layer.
   droplets.push(new Droplet(x, y, r));
 }
 
@@ -684,20 +622,38 @@ function randomSpawn() {
   }
 }
 
+// Distance from point (x,y) to the segment (px,py)-(qx,qy)
+function segDist(px, py, qx, qy, x, y) {
+  const dx = qx - px, dy = qy - py, L = dx * dx + dy * dy;
+  let t = L ? ((x - px) * dx + (y - py) * dy) / L : 0;
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  const cx = px + t * dx, cy = py + t * dy;
+  return Math.hypot(x - cx, y - cy);
+}
+// A fast runner sweeps over a static drop this frame even if their centres never
+// coincided at a sampled position (anti-tunnelling → guarantees a clean path).
+function sweptHit(fast, o) {
+  if (!fast.falling || fast.vy <= CFG.depositSpeedMin || o.falling) return false;
+  return segDist(fast.px, fast.py, fast.x, fast.y, o.x, o.y) < fast.r * 0.95 + o.r;
+}
+
+const _nb = [];   // reused neighbour buffer
 function processMerges() {
   grid.clear();
   for (let i = 0; i < droplets.length; i++)
     if (!droplets[i].dead) grid.insert(droplets[i], i);
   for (let i = 0; i < droplets.length; i++) {
     if (droplets[i].dead) continue;
-    for (const j of grid.neighbors(droplets[i])) {
+    grid.neighbors(droplets[i], _nb);
+    for (const j of _nb) {
       if (j <= i || droplets[j].dead) continue;
-      if (!droplets[i].overlaps(droplets[j])) continue;
-      const fi = droplets[i].falling, fj = droplets[j].falling;
-      if      ( fi && !fj)                     droplets[i].absorb(droplets[j]);
-      else if (!fi &&  fj)                     droplets[j].absorb(droplets[i]);
-      else if (droplets[i].r >= droplets[j].r) droplets[i].absorb(droplets[j]);
-      else                                     droplets[j].absorb(droplets[i]);
+      const a = droplets[i], b = droplets[j];
+      if (!a.overlaps(b) && !sweptHit(a, b) && !sweptHit(b, a)) continue;
+      const fi = a.falling, fj = b.falling;
+      if      ( fi && !fj)         a.absorb(b);
+      else if (!fi &&  fj)         b.absorb(a);
+      else if (a.r >= b.r)         a.absorb(b);
+      else                        b.absorb(a);
     }
   }
 }
@@ -730,7 +686,6 @@ function frame(ts) {
   droplets = droplets.filter(d => !d.dead);
 
   // ── Render ───────────────────────────────────────────────────────────────
-  fadeSmallLayer(dt);
   drawBg();
 
   for (const s of streaks) { s.update(); s.draw(); }
@@ -856,8 +811,8 @@ document.addEventListener('mousedown', e => {
 // ── Resize / Init ─────────────────────────────────────────────────────────────
 function resizeCanvases() {
   // clientWidth/Height が UA の各種バー込みでも正確なビューポートサイズを返す
-  W = canvas.width  = smallCvs.width  = document.documentElement.clientWidth  || window.innerWidth;
-  H = canvas.height = smallCvs.height = document.documentElement.clientHeight || window.innerHeight;
+  W = canvas.width  = document.documentElement.clientWidth  || window.innerWidth;
+  H = canvas.height = document.documentElement.clientHeight || window.innerHeight;
 }
 
 function init() {
