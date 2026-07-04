@@ -79,7 +79,7 @@ input[type=range]{width:100%;cursor:pointer;accent-color:#5aaed4}
 
 // Bump this every deploy so it's obvious which build is actually loaded
 // (open ⚙ to see it, or the console). Helps catch stale browser caching.
-const BUILD = '2026-07-05b · mist-merge+seamless-neck';
+const BUILD = '2026-07-05c · drop-on-thread absorb';
 console.log('Rain on Glass — build:', BUILD);
 
 // Network-first service worker: always loads the freshest deploy when online,
@@ -464,10 +464,47 @@ class Rivulet {
     this.pts = [];
     this.done = false;
     this.headX = null; this.headY = null;  // live attachment point (drop centre)
+    this.owner = null;                     // the drop currently laying it (live)
     this.ownerR = 0;                       // drop radius, for neck sizing
     this.draining = false;                 // orphan mode: recede → feed the bead
     this.bead = null;                      // tracked Droplet growing at the tail
     this.drainAcc = 0;
+  }
+  // Index of the thread point nearest to (x,y) within rad, else -1
+  hitIndex(x, y, rad) {
+    const r2 = rad * rad;
+    let best = -1, bestD = r2;
+    for (let i = 0; i < this.pts.length; i++) {
+      const dx = this.pts[i].x - x, dy = this.pts[i].y - y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < bestD) { bestD = d2; best = i; }
+    }
+    return best;
+  }
+  // A newly-spawned drop d overlaps this thread. Sever at the contact point:
+  // the upper part (older, above d) drains DOWN into d — d grows while that
+  // part recedes from its top — and the lower part keeps flowing to its
+  // original sink. So the drop appears to soak up the water above it and the
+  // thread simply continues out of its underside. Returns true if handled.
+  absorbDrop(d) {
+    const k = this.hitIndex(d.x, d.y, d.r + 3);
+    if (k < 0) return false;
+    if (k >= 2) {
+      const upper = new Rivulet();
+      upper.pts = this.pts.slice(0, k);
+      upper.done = true; upper.draining = true; upper.bead = d;
+      rivulets.push(upper);
+    } else if (k > 0) {
+      // Tiny stub above → just pour it straight into the drop
+      let vol = 0;
+      for (let i = 1; i <= k; i++) {
+        const a = this.pts[i - 1], b = this.pts[i];
+        vol += Math.hypot(b.x - a.x, b.y - a.y) * 1.15;
+      }
+      if (vol > 0) { d.r = Math.cbrt(d.r ** 3 + vol); d.computeShape(); }
+    }
+    this.pts = this.pts.slice(k);   // lower part (junction point k first)
+    return true;
   }
   record(x, y, r) {
     this.headX = x; this.headY = y; this.ownerR = r;
@@ -836,6 +873,7 @@ class Droplet {
       if (!this.rivulet && this.r >= CFG.trailMinR && speed >= CFG.trailMinSpeed
           && rivulets.length < 14) {
         this.rivulet = new Rivulet();
+        this.rivulet.owner = this;
         rivulets.push(this.rivulet);
       }
       if (this.rivulet) {
@@ -1001,6 +1039,9 @@ function spawnAt(x, y, r) {
   const vol = takeMist(x, y, x, y, r * 0.9);
   if (vol > 0) d.r = Math.cbrt(d.r * d.r * d.r + vol);
   droplets.push(d);
+  // Landing on a running/draining water thread: sever it and soak up the water
+  // above so the drop and thread never just overlap without interacting.
+  for (const rv of rivulets) if (rv.absorbDrop(d)) break;
 }
 
 function randomSpawn() {
