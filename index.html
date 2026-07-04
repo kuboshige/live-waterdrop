@@ -79,7 +79,7 @@ input[type=range]{width:100%;cursor:pointer;accent-color:#5aaed4}
 
 // Bump this every deploy so it's obvious which build is actually loaded
 // (open ⚙ to see it, or the console). Helps catch stale browser caching.
-const BUILD = '2026-07-04c · mist-layer+rivulet+sw';
+const BUILD = '2026-07-05 · true-collision+thread-drain';
 console.log('Rain on Glass — build:', BUILD);
 
 // Network-first service worker: always loads the freshest deploy when online,
@@ -382,34 +382,96 @@ function takeMist(px, py, x, y, rad) {
         }
       }
     }
-  mistCtx.save();
-  mistCtx.globalCompositeOperation = 'destination-out';
-  mistCtx.lineCap = 'round';
-  mistCtx.lineWidth = rad * 2;
-  mistCtx.strokeStyle = '#000';
-  mistCtx.beginPath();
-  mistCtx.moveTo(px, py);
-  mistCtx.lineTo(x, y);
-  mistCtx.stroke();
-  mistCtx.restore();
+  // Erase pixels only when something was actually swallowed (or the record
+  // table is saturated and pixel-only beads may exist). Touching the mist
+  // canvas invalidates its GPU texture, so an unconditional per-frame stroke
+  // for every falling drop would force a full re-upload every frame.
+  if (vol > 0 || mist.length >= MIST_MAX) {
+    mistCtx.save();
+    mistCtx.globalCompositeOperation = 'destination-out';
+    mistCtx.lineCap = 'round';
+    mistCtx.lineWidth = rad * 2;
+    mistCtx.strokeStyle = '#000';
+    mistCtx.beginPath();
+    mistCtx.moveTo(px, py);
+    mistCtx.lineTo(x, y);
+    mistCtx.stroke();
+    mistCtx.restore();
+  }
   return vol;
 }
 
 // ── Rivulet (thin water thread left by a running drop) ───────────────────────
-// The ideal trail: the runner leaves a thin thread of water along its path;
-// the thread drains away from the oldest (top) end, and where it dries it
-// breaks up into tiny mist beads dotted along the line.
+// Live: the thread is attached to its running drop — always drawn all the way
+// to the drop's centre, swelling into a neck near it (the drop body is drawn
+// on top, hiding the junction, so the flare reads as an organic meniscus).
+// The oldest (top) end dries into dotted mist beads.
+// Severed / orphaned: the thread IS water — it drains downward into a real
+// tracked bead at its LOWER end. The bead grows by exactly the drained volume
+// while the thread shortens from the top (conservation). A grown bead can
+// itself pass the release threshold and start running.
 class Rivulet {
-  constructor() { this.pts = []; this.done = false; }
-  record(x, y) {
+  constructor() {
+    this.pts = [];
+    this.done = false;
+    this.headX = null; this.headY = null;  // live attachment point (drop centre)
+    this.ownerR = 0;                       // drop radius, for neck sizing
+    this.draining = false;                 // orphan mode: recede → feed the bead
+    this.bead = null;                      // tracked Droplet growing at the tail
+    this.drainAcc = 0;
+  }
+  record(x, y, r) {
+    this.headX = x; this.headY = y; this.ownerR = r;
     const last = this.pts[this.pts.length - 1];
     if (last && Math.hypot(x - last.x, y - last.y) < 5) return;
     this.pts.push({ x, y, ttl: 60 + Math.random() * 55 });
   }
+  // Detach from the owner drop: the thread's water now drains into a bead
+  // born at the thread's lower end.
+  orphan() {
+    this.done = true;
+    this.headX = null;
+    if (this.pts.length < 3) { this.pts.length = 0; return; }
+    const tail = this.pts[this.pts.length - 1];
+    const b = new Droplet(tail.x, tail.y, 2.4);
+    b.impact = 0;
+    droplets.push(b);
+    this.bead = b;
+    this.draining = true;
+  }
+  // Split mid-thread: the upper part becomes an orphan draining thread, the
+  // lower part stays attached to the drop. One skipped point = visible break.
+  sever() {
+    if (this.pts.length < 14) return;
+    const k = 4 + Math.floor(Math.random() * (this.pts.length - 10));
+    const upper = new Rivulet();
+    upper.pts = this.pts.slice(0, k);
+    this.pts  = this.pts.slice(k + 1);
+    rivulets.push(upper);
+    upper.orphan();
+  }
   update(dt) {
+    if (this.draining) {
+      // A falling or absorbed bead no longer collects the thread's water
+      if (this.bead && (this.bead.dead || this.bead.falling)) this.bead = null;
+      this.drainAcc += 3.2 * dt;
+      while (this.drainAcc > 0 && this.pts.length > 1) {
+        const a = this.pts[0], b = this.pts[1];
+        const L = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+        this.drainAcc -= L;
+        if (Math.random() < 0.35)                 // dots where the thread dried
+          addMist(a.x + (Math.random() - 0.5) * 3, a.y, 0.6 + Math.random());
+        if (this.bead) {                          // pour the segment into the bead
+          const vol = L * 1.15;                   // thread cross-section fudge
+          this.bead.r = Math.cbrt(this.bead.r ** 3 + vol);
+        }
+        this.pts.shift();
+      }
+      if (this.pts.length <= 1) { this.pts.length = 0; return true; }
+      return false;
+    }
+    // Live: dry from the oldest end, dotting the dried part with beads
     for (const p of this.pts) p.ttl -= dt;
-    // Points were created oldest-first, so draining the expired head makes the
-    // thread vanish from the top down — where it dries, beads remain.
     let n = 0;
     while (n < this.pts.length && this.pts[n].ttl <= 0) {
       const p = this.pts[n];
@@ -421,17 +483,36 @@ class Rivulet {
     return this.done && this.pts.length === 0;   // true → remove me
   }
   draw() {
-    if (this.pts.length < 2) return;
+    const n = this.pts.length;
+    if (n === 0) return;
+    const live = this.headX !== null;
     ctx.save();
     ctx.lineCap = 'round';
     ctx.strokeStyle = bgDark ? 'rgba(215,235,250,0.30)' : 'rgba(60,90,120,0.28)';
-    for (let i = 1; i < this.pts.length; i++) {
+    for (let i = 1; i < n; i++) {
       const a = this.pts[i - 1], b = this.pts[i];
-      ctx.lineWidth = Math.max(0.35, Math.min(1.8, Math.min(a.ttl, b.ttl) * 0.035));
-      ctx.beginPath();
-      ctx.moveTo(a.x, a.y);
-      ctx.lineTo(b.x, b.y);
-      ctx.stroke();
+      let w = Math.max(0.35, Math.min(1.8, Math.min(a.ttl, b.ttl) * 0.035));
+      if (live) {
+        // Neck: swell toward the drop so the thread flows out of it
+        const dh = Math.hypot(b.x - this.headX, b.y - this.headY);
+        const neckLen = this.ownerR * 3;
+        if (dh < neckLen) w += (1 - dh / neckLen) * this.ownerR * 0.5;
+      }
+      ctx.lineWidth = w;
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    }
+    // Always connect the newest point to the drop centre — the drop is drawn
+    // on top, so the thread visually emerges from inside it (never detached).
+    if (live) {
+      const last = this.pts[n - 1];
+      ctx.lineWidth = Math.min(this.ownerR * 0.55, 1.8 + this.ownerR * 0.4);
+      ctx.beginPath(); ctx.moveTo(last.x, last.y); ctx.lineTo(this.headX, this.headY); ctx.stroke();
+    }
+    // Draining: connect the tail into its growing bead the same way
+    if (this.draining && this.bead && n >= 2) {
+      const from = this.pts[Math.max(0, n - 3)];
+      ctx.lineWidth = 2.0;
+      ctx.beginPath(); ctx.moveTo(from.x, from.y); ctx.lineTo(this.bead.x, this.bead.y); ctx.stroke();
     }
     ctx.restore();
   }
@@ -474,13 +555,16 @@ class SpatialGrid {
   }
   // Fills the caller-supplied array (reused across calls) to avoid per-frame
   // allocation churn / GC spikes when there are hundreds of drops.
-  // The search radius grows with this drop's size PLUS the largest drop on
-  // screen (gridMaxR), so a big drop touching this one is never missed even
-  // when its centre sits several cells away (fixes "touching but not merging").
+  // Search range scales with THIS drop's own visual reach only: in any touching
+  // pair the larger drop's reach bounds the centre distance (d ≤ 2·bigReach),
+  // so the larger one always finds the smaller — tiny drops keep a cheap 3×3
+  // scan and only actual giants scan wider. (processMerges checks both
+  // directions, so one-sided discovery is enough.)
   neighbors(d, out) {
     out.length = 0;
-    const cell = CFG.gridCell;
-    const range = Math.min(4, 1 + Math.floor((d.r + gridMaxR) / cell));
+    const cell  = CFG.gridCell;
+    const reach = Math.max(d.shRx, d.shRy);
+    const range = Math.min(3, 1 + Math.floor((2 * reach + 2) / cell));
     const cx = Math.floor(d.x/cell), cy = Math.floor(d.y/cell);
     for (let dx = -range; dx <= range; dx++)
       for (let dy = -range; dy <= range; dy++) {
@@ -513,29 +597,67 @@ class Droplet {
     this.vibTimer   = 0;
     // Coalescence oscillation ("ぷるぷる"): amplitude, phase, angular freq
     this.osc = 0; this.oscPhase = 0; this.oscFreq = 0;
+    // Birth wobble: landing drops pulse too (and that pulse can touch a
+    // neighbour — the shape below feeds the collision test, so it merges)
+    if (r >= 6) { this.osc = 0.20; this.oscFreq = (Math.PI * 2) / (6 + r * 0.25); }
     // Meander: per-drop wander frequency for a non-straight run
     this.wanderF = 0.05 + Math.random() * 0.05;
+    this.computeShape();
   }
 
   get area() { return Math.PI * this.r * this.r; }
 
+  // THE single source of truth for this drop's current visual ellipse.
+  // draw() renders exactly this and overlaps() collides exactly this, so
+  // "the rims look like they touch" and "they merge" can never disagree.
+  // Includes: tap bump, spawn-impact spread, fall flattening, pre-release
+  // omen stretch, and the coalescence/birth wobble.
+  computeShape() {
+    const impRad = 1 + Math.max(0, this.impact * 0.28);
+    const r = this.r * (1 + Math.max(0, this.bump)) * impRad;
+    const spd = this.falling ? Math.abs(this.vy) : 0;
+    const tn  = Math.min(1, spd / CFG.maxSpeed);
+    let sx = 1, sy = 1;
+    if (this.falling) {
+      sx = 1 + tn * tn * 0.55;
+      sy = Math.max(0.58, 1 / (sx * 1.12));
+    } else if (this.impact > 0) {
+      sx = 1 + this.impact * 0.22;
+      sy = Math.max(0.78, 1 / (sx * 1.06));
+    } else {
+      // Pre-release omen: nearing the tipping size, it stretches and trembles
+      const preStart = CFG.fallThresh * 0.85;
+      const releaseR = CFG.fallThresh + this.pinExtra;
+      const near = Math.max(0, Math.min(1, (this.r - preStart) / (releaseR - preStart)));
+      if (near > 0) {
+        sy = 1 + near * 0.06;
+        const tr = Math.sin(this.age * 0.5) * near * 0.015;
+        sx += tr; sy -= tr;
+      }
+    }
+    // Coalescence/birth wobble: x/y pulse out of phase (volume-preserving)
+    if (this.osc > 0) {
+      const o = this.osc * Math.sin(this.oscPhase);
+      sx *= 1 + o; sy *= 1 - o;
+    }
+    this.shR = r; this.shSx = sx; this.shSy = sy;
+    this.shRx = r * sx; this.shRy = r * sy;
+  }
+
+  // Radius of this drop's current ellipse along direction (ux,uy)
+  radiusAlong(ux, uy) {
+    return (this.shRx * this.shRy) / Math.hypot(this.shRy * ux, this.shRx * uy);
+  }
+
   overlaps(o) {
-    const dx = this.x - o.x, dy = this.y - o.y;
-    // Effective radius = max semi-axis of the ellipse (horizontal for oblate drops)
-    // falling: oblate deformation; impact: spreading on landing; static: circle
-    const myTn  = this.falling ? Math.min(1, Math.abs(this.vy) / CFG.maxSpeed) : 0;
-    const mySx  = this.falling ? 1 + myTn * myTn * 0.55
-                : this.impact > 0 ? 1 + this.impact * 0.22 : 1;
-    const myEff = this.r * mySx * (1 + this.impact * 0.45);
-
-    const oTn   = o.falling ? Math.min(1, Math.abs(o.vy) / CFG.maxSpeed) : 0;
-    const oSx   = o.falling ? 1 + oTn * oTn * 0.55
-                : o.impact > 0 ? 1 + o.impact * 0.22 : 1;
-    const oEff  = o.r * oSx * (1 + o.impact * 0.45);
-
-    // Merge as soon as the rims touch (edges in contact) — a touch eager (1.02)
-    const rr = (myEff + oEff) * 1.02;
-    return dx * dx + dy * dy < rr * rr;
+    const dx = o.x - this.x, dy = o.y - this.y;
+    const d2 = dx * dx + dy * dy;
+    const quick = Math.max(this.shRx, this.shRy) + Math.max(o.shRx, o.shRy) + 2;
+    if (d2 > quick * quick) return false;
+    const d  = Math.sqrt(d2) || 1e-4;
+    const ux = dx / d, uy = dy / d;
+    // +1.2px: the drawn dark rim sits just outside the fill — rims touch = merge
+    return d < this.radiusAlong(ux, uy) + o.radiusAlong(ux, uy) + 1.2;
   }
 
   absorb(o) {
@@ -559,6 +681,10 @@ class Droplet {
     }
     if (o.vy > this.vy) this.vy = o.vy * 0.45;
     o.dead = true;
+    // The merged, larger footprint swallows any mist beads now underneath it
+    const mv = takeMist(this.x, this.y, this.x, this.y, this.r * 0.9);
+    if (mv > 0) this.r = Math.cbrt(this.r * this.r * this.r + mv);
+    this.computeShape();
   }
 
   update(dt) {
@@ -638,19 +764,25 @@ class Droplet {
 
       // Sweep: absorb the mist along the swept path — the pixels are wiped
       // clean and their volume feeds this drop, so it grows as it runs.
+      // No speed gate: even a slowly creeping drop swallows what it touches.
       const speed = Math.hypot(this.vx, this.vy);
-      if (speed > CFG.depositSpeedMin) {
+      {
         const vol = takeMist(this.px, this.py, this.x, this.y, this.r * 0.95);
         if (vol > 0) this.r = Math.cbrt(this.r * this.r * this.r + vol);
       }
-      // Rivulet: a big fast drop leaves a thin water thread along its path.
-      // It drains from the top end later, breaking up into mist beads.
-      if (this.r >= CFG.trailMinR && speed >= CFG.trailMinSpeed) {
-        if (!this.rivulet && rivulets.length < 14) {
-          this.rivulet = new Rivulet();
-          rivulets.push(this.rivulet);
-        }
-        if (this.rivulet) this.rivulet.record(this.x, this.y);
+      // Rivulet: a big fast drop starts laying a thin water thread, and keeps
+      // laying it (even through slow stick phases) so the thread is never
+      // detached from the drop. Occasionally the thread snaps mid-way — the
+      // severed upper part drains into a bead at its lower end.
+      if (!this.rivulet && this.r >= CFG.trailMinR && speed >= CFG.trailMinSpeed
+          && rivulets.length < 14) {
+        this.rivulet = new Rivulet();
+        rivulets.push(this.rivulet);
+      }
+      if (this.rivulet) {
+        this.rivulet.record(this.x, this.y, this.r);
+        if (this.rivulet.pts.length > 20 && Math.random() < 0.006 * dt)
+          this.rivulet.sever();
       }
 
       // Despawn once fully past the downstream screen edge (along gravity)
@@ -660,40 +792,14 @@ class Droplet {
     }
 
     this.px = this.x; this.py = this.y;
+    this.computeShape();   // cache the visual ellipse for this frame's collisions
   }
 
   draw() {
-    const impRad = 1 + Math.max(0, this.impact * 0.28);
-    const r = this.r * (1 + Math.max(0, this.bump)) * impRad;
-
-    // Oblate deformation: speed-based (and gentle spread during impact)
-    const spd = this.falling ? Math.abs(this.vy) : 0;
-    const tn  = Math.min(1, spd / CFG.maxSpeed);
-    let sx = 1, sy = 1;
-    if (this.falling) {
-      sx = 1 + tn * tn * 0.55;
-      sy = Math.max(0.58, 1 / (sx * 1.12));
-    } else if (this.impact > 0) {
-      // Spreading on impact: briefly wider/flatter
-      sx = 1 + this.impact * 0.22;
-      sy = Math.max(0.78, 1 / (sx * 1.06));
-    } else {
-      // Pre-release omen: nearing the tipping size, it stretches and trembles
-      const preStart = CFG.fallThresh * 0.85;
-      const releaseR = CFG.fallThresh + this.pinExtra;
-      const near = Math.max(0, Math.min(1, (this.r - preStart) / (releaseR - preStart)));
-      if (near > 0) {
-        sy = 1 + near * 0.06;
-        const tr = Math.sin(this.age * 0.5) * near * 0.015;
-        sx += tr; sy -= tr;
-      }
-    }
-    // Coalescence wobble (ぷるぷる): x/y pulse out of phase (volume-preserving)
-    if (this.osc > 0) {
-      const o = this.osc * Math.sin(this.oscPhase);
-      sx *= 1 + o; sy *= 1 - o;
-    }
-    const rx = r * sx, ry = r * sy;
+    // Render exactly the ellipse the collision system uses (computeShape)
+    this.computeShape();
+    const r = this.shR, sx = this.shSx, sy = this.shSy;
+    const rx = this.shRx, ry = this.shRy;
     const rMax = Math.max(rx, ry);
     const x = this.x, y = this.y;
 
@@ -857,17 +963,18 @@ function sweptHit(fast, o) {
 }
 
 const _nb = [];   // reused neighbour buffer
-let gridMaxR = 0; // largest drop radius this frame (sets neighbour search range)
 function processMerges() {
   grid.clear();
-  gridMaxR = 0;
   for (let i = 0; i < droplets.length; i++)
-    if (!droplets[i].dead) { grid.insert(droplets[i], i); if (droplets[i].r > gridMaxR) gridMaxR = droplets[i].r; }
+    if (!droplets[i].dead) grid.insert(droplets[i], i);
   for (let i = 0; i < droplets.length; i++) {
     if (droplets[i].dead) continue;
     grid.neighbors(droplets[i], _nb);
     for (const j of _nb) {
-      if (j <= i || droplets[j].dead) continue;
+      // No j<=i dedup: with size-scaled search ranges a pair may be visible
+      // from only ONE side (the larger drop). Checking both directions is
+      // required; a re-encounter after a merge is skipped by the dead check.
+      if (j === i || droplets[i].dead || droplets[j].dead) continue;
       const a = droplets[i], b = droplets[j];
       if (!a.overlaps(b) && !sweptHit(a, b) && !sweptHit(b, a)) continue;
       const fi = a.falling, fj = b.falling;
@@ -905,11 +1012,14 @@ function frame(ts) {
   for (const d of droplets) d.update(dt);
   processMerges();
 
-  // Cull dead; orphaned rivulets finish draining on their own
+  // Cull dead. A dead drop's rivulet is orphaned AFTER the filter — orphan()
+  // spawns the drain-bead into droplets, which must not happen mid-filter.
+  const orphaned = [];
   droplets = droplets.filter(d => {
-    if (d.dead && d.rivulet) d.rivulet.done = true;
+    if (d.dead && d.rivulet) orphaned.push(d.rivulet);
     return !d.dead;
   });
+  for (const rv of orphaned) rv.orphan();
 
   // Rivulets: drain from the top, deposit beads, drop empties
   for (let i = rivulets.length - 1; i >= 0; i--) {
@@ -1032,14 +1142,19 @@ function onPointer(e) {
     const px = (p.clientX - rect.left) * scx;
     const py = (p.clientY - rect.top)  * scy;
 
-    // Tap vibration: near-threshold drops nudge downward
+    // Tap vibration: near-threshold drops nudge downward — and swallow any
+    // mist beads they slide onto (they visibly land on them, so they merge)
     const vibrThresh = CFG.fallThresh * 0.72;
     for (const d of droplets) {
       if (d.falling || d.r < vibrThresh) continue;
       const ratio = (d.r - vibrThresh) / (CFG.fallThresh - vibrThresh + d.pinExtra);
+      const oldY = d.y;
       d.y    += ratio * d.r * 0.50;
       d.bump  = Math.max(d.bump, 0.07 + ratio * 0.09);
       d.vibTimer = 8;
+      const vol = takeMist(d.x, oldY, d.x, d.y, d.r * 0.9);
+      if (vol > 0) d.r = Math.cbrt(d.r * d.r * d.r + vol);
+      d.computeShape();
     }
 
     // Spawn drops at tap
