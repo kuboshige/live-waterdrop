@@ -2,6 +2,9 @@
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -73,6 +76,11 @@ input[type=range]{width:100%;cursor:pointer;accent-color:#5aaed4}
 
 <script>
 'use strict';
+
+// Bump this every deploy so it's obvious which build is actually loaded
+// (open ⚙ to see it, or the console). Helps catch stale browser caching.
+const BUILD = '2026-07-04 · real-drops+gravity+comet';
+console.log('Rain on Glass — build:', BUILD);
 
 // ── Canvas ────────────────────────────────────────────────────────────────────
 const canvas   = document.getElementById('c');
@@ -791,6 +799,14 @@ function frame(ts) {
 const settingsBtn   = document.getElementById('settingsBtn');
 const settingsPanel = document.getElementById('settingsPanel');
 let settingsTimer   = null;
+
+// Small build tag at the bottom of the settings panel (verify fresh load)
+(() => {
+  const v = document.createElement('div');
+  v.textContent = 'build ' + BUILD;
+  v.style.cssText = 'margin-top:12px;font-size:10px;opacity:0.45;text-align:center';
+  settingsPanel.appendChild(v);
+})();
 
 function showSettingsBtn() {
   settingsBtn.classList.add('vis');
