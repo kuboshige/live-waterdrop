@@ -79,7 +79,7 @@ input[type=range]{width:100%;cursor:pointer;accent-color:#5aaed4}
 
 // Bump this every deploy so it's obvious which build is actually loaded
 // (open ⚙ to see it, or the console). Helps catch stale browser caching.
-const BUILD = '2026-07-05 · true-collision+thread-drain';
+const BUILD = '2026-07-05b · mist-merge+seamless-neck';
 console.log('Rain on Glass — build:', BUILD);
 
 // Network-first service worker: always loads the freshest deploy when online,
@@ -336,8 +336,57 @@ function paintMist(x, y, r) {
   mistCtx.stroke();
 }
 
-function addMist(x, y, r) {
+function eraseMistCircle(x, y, rad) {
+  mistCtx.save();
+  mistCtx.globalCompositeOperation = 'destination-out';
+  mistCtx.fillStyle = '#000';
+  mistCtx.beginPath();
+  mistCtx.arc(x, y, rad, 0, Math.PI * 2);
+  mistCtx.fill();
+  mistCtx.restore();
+}
+
+// raw=true skips the merge checks (used for repaints/demotions to avoid loops)
+function addMist(x, y, r, raw) {
   if (r < 0.4 || x < -4 || x > W + 4 || y < -4 || y > H + 4) return;
+  if (!raw) {
+    // Landing on (or just beside) a tracked drop → it joins that drop.
+    // Hit-box sticks out a little beyond the visual rim (reads better).
+    for (const d of droplets) {
+      if (d.dead) continue;
+      const dx = d.x - x, dy = d.y - y;
+      const reach = Math.max(d.shRx, d.shRy) * 0.95 + r * 1.3;
+      if (dx * dx + dy * dy < reach * reach) {
+        d.r = Math.cbrt(d.r * d.r * d.r + r * r * r);
+        d.computeShape();
+        return;
+      }
+    }
+    // Touching an existing bead → merge them (mist-mist collision). If the
+    // merged bead crosses MIST_R it graduates into a real simulated drop.
+    const g0x = Math.floor((x - r - 7) / MIST_CELL), g1x = Math.floor((x + r + 7) / MIST_CELL);
+    const g0y = Math.floor((y - r - 7) / MIST_CELL), g1y = Math.floor((y + r + 7) / MIST_CELL);
+    for (let gx = g0x; gx <= g1x; gx++)
+      for (let gy = g0y; gy <= g1y; gy++) {
+        const c = mistGrid.get(gx + ',' + gy);
+        if (!c) continue;
+        for (const i of c) {
+          const m = mist[i];
+          if (!m || m.dead) continue;
+          const dx = m.x - x, dy = m.y - y;
+          const rr = (m.r + r) * 1.2 + 0.8;      // slightly proud hit-box
+          if (dx * dx + dy * dy >= rr * rr) continue;
+          const v1 = m.r ** 3, v2 = r ** 3, vt = v1 + v2;
+          const nx = (m.x * v1 + x * v2) / vt, ny = (m.y * v1 + y * v2) / vt;
+          const nr = Math.cbrt(vt);
+          m.dead = true;
+          eraseMistCircle(m.x, m.y, m.r + 0.8);
+          if (nr >= MIST_R) { spawnAt(nx, ny, nr); return; }   // graduate
+          addMist(nx, ny, nr, true);
+          return;
+        }
+      }
+  }
   paintMist(x, y, r);
   if (mist.length >= MIST_MAX) compactMist();
   if (mist.length >= MIST_MAX) return;          // saturated: keep pixels only
@@ -482,37 +531,47 @@ class Rivulet {
     if (n > 0) this.pts.splice(0, n);
     return this.done && this.pts.length === 0;   // true → remove me
   }
+  // Rendered in the SAME optical language as the drops — a dark water edge
+  // with a bright specular core — so drop and thread read as one material.
+  // The neck flares quadratically (meniscus) and is drawn to the drop centre;
+  // the drop body on top hides the joint, so there is no visible seam.
   draw() {
     const n = this.pts.length;
     if (n === 0) return;
     const live = this.headX !== null;
+    const neckLen = this.ownerR * 2.6;
     ctx.save();
     ctx.lineCap = 'round';
-    ctx.strokeStyle = bgDark ? 'rgba(215,235,250,0.30)' : 'rgba(60,90,120,0.28)';
-    for (let i = 1; i < n; i++) {
-      const a = this.pts[i - 1], b = this.pts[i];
-      let w = Math.max(0.35, Math.min(1.8, Math.min(a.ttl, b.ttl) * 0.035));
-      if (live) {
-        // Neck: swell toward the drop so the thread flows out of it
-        const dh = Math.hypot(b.x - this.headX, b.y - this.headY);
-        const neckLen = this.ownerR * 3;
-        if (dh < neckLen) w += (1 - dh / neckLen) * this.ownerR * 0.5;
+    for (let pass = 0; pass < 2; pass++) {
+      ctx.strokeStyle = pass === 0
+        ? (bgDark ? 'rgba(190,215,235,0.34)' : 'rgba(28,52,76,0.30)')
+        : 'rgba(255,255,255,0.30)';
+      for (let i = 1; i < n; i++) {
+        const a = this.pts[i - 1], b = this.pts[i];
+        let w = Math.max(0.5, Math.min(2.0, Math.min(a.ttl, b.ttl) * 0.04));
+        if (live) {
+          const dh = Math.hypot(b.x - this.headX, b.y - this.headY);
+          if (dh < neckLen) {
+            const t = 1 - dh / neckLen;
+            w += t * t * this.ownerR * 1.05;   // quadratic meniscus flare
+          }
+        }
+        ctx.lineWidth = pass === 0 ? w : Math.max(0.35, w * 0.42);
+        ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
       }
-      ctx.lineWidth = w;
-      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
-    }
-    // Always connect the newest point to the drop centre — the drop is drawn
-    // on top, so the thread visually emerges from inside it (never detached).
-    if (live) {
-      const last = this.pts[n - 1];
-      ctx.lineWidth = Math.min(this.ownerR * 0.55, 1.8 + this.ownerR * 0.4);
-      ctx.beginPath(); ctx.moveTo(last.x, last.y); ctx.lineTo(this.headX, this.headY); ctx.stroke();
-    }
-    // Draining: connect the tail into its growing bead the same way
-    if (this.draining && this.bead && n >= 2) {
-      const from = this.pts[Math.max(0, n - 3)];
-      ctx.lineWidth = 2.0;
-      ctx.beginPath(); ctx.moveTo(from.x, from.y); ctx.lineTo(this.bead.x, this.bead.y); ctx.stroke();
+      // Connect the newest point to the drop centre, at full neck width
+      if (live) {
+        const last = this.pts[n - 1];
+        const w = Math.min(this.ownerR * 1.05, 2.0 + this.ownerR * 0.9);
+        ctx.lineWidth = pass === 0 ? w : w * 0.42;
+        ctx.beginPath(); ctx.moveTo(last.x, last.y); ctx.lineTo(this.headX, this.headY); ctx.stroke();
+      }
+      // Draining: connect the tail into its growing bead the same way
+      if (this.draining && this.bead && n >= 2) {
+        const from = this.pts[Math.max(0, n - 3)];
+        ctx.lineWidth = pass === 0 ? 2.2 : 1.0;
+        ctx.beginPath(); ctx.moveTo(from.x, from.y); ctx.lineTo(this.bead.x, this.bead.y); ctx.stroke();
+      }
     }
     ctx.restore();
   }
@@ -789,6 +848,13 @@ class Droplet {
       if ((GRAV.y > 0 && this.y - this.r > H) || (GRAV.y < 0 && this.y + this.r < 0) ||
           (GRAV.x > 0 && this.x - this.r > W) || (GRAV.x < 0 && this.x + this.r < 0))
         this.dead = true;
+    } else if (this.age % 24 < dt) {
+      // Static drops periodically sweep their own footprint (staggered by the
+      // random birth age): whatever mist ended up underneath gets swallowed —
+      // no matter how it got there. Belt-and-braces for "covered but unmerged".
+      const vol = takeMist(this.x, this.y, this.x, this.y,
+                           Math.max(this.shRx, this.shRy) * 0.95);
+      if (vol > 0) this.r = Math.cbrt(this.r * this.r * this.r + vol);
     }
 
     this.px = this.x; this.py = this.y;
@@ -926,7 +992,7 @@ function spawnAt(x, y, r) {
     }
     if (mi < 0) return;              // everything is falling (vanishingly rare)
     const dm = droplets[mi];
-    addMist(dm.x, dm.y, dm.r);
+    addMist(dm.x, dm.y, dm.r, true); // raw: a demotion must not re-promote
     droplets[mi] = droplets[droplets.length - 1];
     droplets.pop();
   }
@@ -1037,9 +1103,10 @@ function frame(ts) {
 
   for (const rv of rivulets) rv.draw();
 
-  // Short tails behind running drops (drawn before the drops themselves)
+  // Short tails behind running drops (drawn before the drops themselves).
+  // Drops with a live rivulet get their tail from the neck flare instead.
   for (const d of droplets)
-    if (d.falling && d.vy > CFG.depositSpeedMin) drawTail(d);
+    if (d.falling && d.vy > CFG.depositSpeedMin && !d.rivulet) drawTail(d);
 
   for (const d of droplets) if (!d.falling) d.draw();
   for (const d of droplets) if ( d.falling) d.draw();
