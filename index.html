@@ -79,7 +79,7 @@ input[type=range]{width:100%;cursor:pointer;accent-color:#5aaed4}
 
 // Bump this every deploy so it's obvious which build is actually loaded
 // (open ⚙ to see it, or the console). Helps catch stale browser caching.
-const BUILD = '2026-07-04 · real-drops+gravity+comet';
+const BUILD = '2026-07-04b · mist-layer+rivulet';
 console.log('Rain on Glass — build:', BUILD);
 
 // ── Canvas ────────────────────────────────────────────────────────────────────
@@ -110,7 +110,7 @@ function updateHud(dt) {
   hudEl.textContent =
     `FPS ${avg(fpsBuf).toFixed(0)}\n` +
     `ms  ${avg(msBuf).toFixed(1)} / max ${mx(msBuf).toFixed(1)}\n` +
-    `drops ${droplets.length}\n` +
+    `drops ${droplets.length}  mist ${mist.length}  riv ${rivulets.length}\n` +
     `bg ${bgDark ? 'dark' : 'light'}${bgHasImg ? ' img' : ''}  test ${modes[testBgMode]}`;
 }
 
@@ -175,6 +175,7 @@ function updateBgCvs() {
   bgCtx2.filter = 'none';
   bgReady = true; bgHasImg = true;
   computeBgDark();
+  redrawMist();   // mist colours depend on bgDark — repaint for the new bg
 }
 
 // Render the default gradient into bgCvs so it can be refracted like a photo
@@ -237,12 +238,10 @@ const CFG = {
   refrMag:        1.65,
   gridCell:       28,
   depositSpeedMin:2.8,   // speed above which a drop is "running" (draws a tail)
-  depositInterval:4,
-  // Dotted "comet" trail: a big, fast drop sheds fine droplets along its path.
-  // Only drops at least trailMinR big AND moving at least trailMinSpeed do this.
+  // Rivulet gate: only drops at least trailMinR big AND moving at least
+  // trailMinSpeed leave the thin draining water-thread behind them.
   trailMinR:      12,
   trailMinSpeed:  7,
-  trailStep:      12,    // px between shed droplets
 };
 
 // Gravity direction as a UNIT vector. Right now it points straight down the
@@ -294,6 +293,141 @@ function refractRings(x, y, rx, ry) {
     ctx.scale(-RING_MAG[k], -RING_MAG[k]);   // negative = inverted (倒立) lens image
     ctx.translate(-x, -y);
     ctx.drawImage(bgCvs, 0, 0);
+    ctx.restore();
+  }
+}
+
+// ── Static mist layer ─────────────────────────────────────────────────────────
+// Drops below MIST_R never move, wobble, or react to taps — so simulating them
+// is wasted CPU. They are baked once into an offscreen canvas (zero per-frame
+// cost, any quantity) and NEVER fade or evaporate. A lightweight record of each
+// bead (x, y, r) is kept in a coarse grid so running drops can absorb them:
+// the pixels get wiped along the path and their volume feeds the runner.
+const MIST_R    = 3.0;
+const MIST_MAX  = 6000;   // beyond this, new beads are pixels-only (no record)
+const MIST_CELL = 26;
+const mistCvs = document.createElement('canvas');
+const mistCtx = mistCvs.getContext('2d');
+let mist = [];                 // { x, y, r, dead }
+const mistGrid = new Map();    // "gx,gy" → indices into mist
+
+function mistKey(x, y) { return ((x / MIST_CELL) | 0) + ',' + ((y / MIST_CELL) | 0); }
+
+function paintMist(x, y, r) {
+  mistCtx.beginPath();
+  mistCtx.arc(x, y, r, 0, Math.PI * 2);
+  mistCtx.fillStyle = bgDark ? 'rgba(220,236,250,0.10)' : 'rgba(24,44,64,0.11)';
+  mistCtx.fill();
+  if (r > 1.6) {
+    mistCtx.beginPath();
+    mistCtx.arc(x - r * 0.2, y - r * 0.28, Math.max(0.5, r * 0.32), 0, Math.PI * 2);
+    mistCtx.fillStyle = 'rgba(255,255,255,0.45)';
+    mistCtx.fill();
+  }
+  mistCtx.beginPath();
+  mistCtx.arc(x, y, r, 0, Math.PI * 2);
+  mistCtx.strokeStyle = 'rgba(10,25,45,0.34)';
+  mistCtx.lineWidth = 0.5;
+  mistCtx.stroke();
+}
+
+function addMist(x, y, r) {
+  if (r < 0.4 || x < -4 || x > W + 4 || y < -4 || y > H + 4) return;
+  paintMist(x, y, r);
+  if (mist.length >= MIST_MAX) compactMist();
+  if (mist.length >= MIST_MAX) return;          // saturated: keep pixels only
+  const idx = mist.length;
+  mist.push({ x, y, r, dead: false });
+  const k = mistKey(x, y);
+  let c = mistGrid.get(k); if (!c) { c = []; mistGrid.set(k, c); }
+  c.push(idx);
+}
+
+function compactMist() {
+  mist = mist.filter(m => !m.dead);
+  mistGrid.clear();
+  for (let i = 0; i < mist.length; i++) {
+    const k = mistKey(mist[i].x, mist[i].y);
+    let c = mistGrid.get(k); if (!c) { c = []; mistGrid.set(k, c); }
+    c.push(i);
+  }
+}
+
+function redrawMist() {
+  mistCtx.clearRect(0, 0, W, H);
+  for (const m of mist) if (!m.dead) paintMist(m.x, m.y, m.r);
+}
+
+// Absorb every mist bead within `rad` of the segment (px,py)→(x,y): wipe the
+// pixels (destination-out capsule) and return the total absorbed volume (Σr³).
+function takeMist(px, py, x, y, rad) {
+  let vol = 0;
+  const x0 = Math.min(px, x) - rad - 4, x1 = Math.max(px, x) + rad + 4;
+  const y0 = Math.min(py, y) - rad - 4, y1 = Math.max(py, y) + rad + 4;
+  for (let gx = Math.floor(x0 / MIST_CELL); gx <= Math.floor(x1 / MIST_CELL); gx++)
+    for (let gy = Math.floor(y0 / MIST_CELL); gy <= Math.floor(y1 / MIST_CELL); gy++) {
+      const c = mistGrid.get(gx + ',' + gy);
+      if (!c) continue;
+      for (const i of c) {
+        const m = mist[i];
+        if (!m || m.dead) continue;
+        if (segDist(px, py, x, y, m.x, m.y) < rad + m.r) {
+          m.dead = true;
+          vol += m.r * m.r * m.r;
+        }
+      }
+    }
+  mistCtx.save();
+  mistCtx.globalCompositeOperation = 'destination-out';
+  mistCtx.lineCap = 'round';
+  mistCtx.lineWidth = rad * 2;
+  mistCtx.strokeStyle = '#000';
+  mistCtx.beginPath();
+  mistCtx.moveTo(px, py);
+  mistCtx.lineTo(x, y);
+  mistCtx.stroke();
+  mistCtx.restore();
+  return vol;
+}
+
+// ── Rivulet (thin water thread left by a running drop) ───────────────────────
+// The ideal trail: the runner leaves a thin thread of water along its path;
+// the thread drains away from the oldest (top) end, and where it dries it
+// breaks up into tiny mist beads dotted along the line.
+class Rivulet {
+  constructor() { this.pts = []; this.done = false; }
+  record(x, y) {
+    const last = this.pts[this.pts.length - 1];
+    if (last && Math.hypot(x - last.x, y - last.y) < 5) return;
+    this.pts.push({ x, y, ttl: 60 + Math.random() * 55 });
+  }
+  update(dt) {
+    for (const p of this.pts) p.ttl -= dt;
+    // Points were created oldest-first, so draining the expired head makes the
+    // thread vanish from the top down — where it dries, beads remain.
+    let n = 0;
+    while (n < this.pts.length && this.pts[n].ttl <= 0) {
+      const p = this.pts[n];
+      if (Math.random() < 0.5)
+        addMist(p.x + (Math.random() - 0.5) * 3, p.y, 0.7 + Math.random() * 1.2);
+      n++;
+    }
+    if (n > 0) this.pts.splice(0, n);
+    return this.done && this.pts.length === 0;   // true → remove me
+  }
+  draw() {
+    if (this.pts.length < 2) return;
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = bgDark ? 'rgba(215,235,250,0.30)' : 'rgba(60,90,120,0.28)';
+    for (let i = 1; i < this.pts.length; i++) {
+      const a = this.pts[i - 1], b = this.pts[i];
+      ctx.lineWidth = Math.max(0.35, Math.min(1.8, Math.min(a.ttl, b.ttl) * 0.035));
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+    }
     ctx.restore();
   }
 }
@@ -361,11 +495,10 @@ class Droplet {
     this.vy = 0; this.vx = (Math.random() - 0.5) * 0.15;
     this.falling = false; this.dead = false; this.bump = 0;
     this.age = Math.random() * 100;     // for per-drop tremble / wander phase
-    this.lastDepositY = y;
     // Spawn impact spread: briefly larger collision radius so nearby drops merge
     this.impact = 0.75;
-    // TTL for tiny beads
-    this.ttl = r < 3.5 ? 150 + Math.random() * 260 : Infinity;
+    // Rivulet (thin water thread) this drop is currently laying down, if any
+    this.rivulet = null;
     // Contact-line pinning: narrower random range for hydrophobic surface
     this.pinExtra  = 0.6 + Math.random() * 2.2;
     this.pinReleased = false;
@@ -410,7 +543,6 @@ class Droplet {
       this.y = (this.y * w1 + o.y * w2) / wt;
     }
     this.r   = Math.cbrt(vt);
-    this.ttl = Infinity;
     // Coalescence wobble ("ぷるん"). Only drops big enough to be perceptible (and
     // that might eventually run) wobble visibly — tiny drops physically settle
     // faster than the eye can follow, so we skip it entirely for them.
@@ -425,12 +557,6 @@ class Droplet {
   }
 
   update(dt) {
-    if (this.ttl !== Infinity) {
-      this.ttl -= dt;
-      if (this.ttl <= 0) { this.dead = true; return; }
-      if (this.ttl < 45) this.r *= Math.pow(0.96, dt); // evaporate away smoothly
-    }
-
     this.age += dt;
     if (this.impact   > 0) this.impact   = Math.max(0, this.impact   - 0.09 * dt);
     if (this.bump     > 0) this.bump     = Math.max(0, this.bump     - 0.012 * dt);
@@ -449,7 +575,6 @@ class Droplet {
       this.falling     = true;
       this.pinReleased = true;
       this.vy          = 0.8 + Math.random() * 0.7; // release jerk
-      this.lastDepositY = this.y;
       this.px = this.x; this.py = this.y;           // start sweep from here
       this.slipPhase   = this.slipPeriod * 0.6;
     }
@@ -506,18 +631,21 @@ class Droplet {
       this.vx = pxv + al * GRAV.x;
       this.vy = pyv + al * GRAV.y;
 
-      // A running drop cleans the mist it sweeps over (via absorption), but a
-      // big, fast one also sheds a dotted "comet" trail of fine droplets. These
-      // are dropped ~2r BEHIND the body so the sweep doesn't re-absorb them.
+      // Sweep: absorb the mist along the swept path — the pixels are wiped
+      // clean and their volume feeds this drop, so it grows as it runs.
       const speed = Math.hypot(this.vx, this.vy);
+      if (speed > CFG.depositSpeedMin) {
+        const vol = takeMist(this.px, this.py, this.x, this.y, this.r * 0.95);
+        if (vol > 0) this.r = Math.cbrt(this.r * this.r * this.r + vol);
+      }
+      // Rivulet: a big fast drop leaves a thin water thread along its path.
+      // It drains from the top end later, breaking up into mist beads.
       if (this.r >= CFG.trailMinR && speed >= CFG.trailMinSpeed) {
-        while (this.y - this.lastDepositY >= CFG.trailStep) {
-          this.lastDepositY += CFG.trailStep;
-          const off = (Math.random() - 0.5) * this.r * 0.7;
-          spawnAt(this.x + off, this.lastDepositY - this.r * 2.1, 1.1 + Math.random() * 1.6);
+        if (!this.rivulet && rivulets.length < 14) {
+          this.rivulet = new Rivulet();
+          rivulets.push(this.rivulet);
         }
-      } else {
-        this.lastDepositY = this.y;
+        if (this.rivulet) this.rivulet.record(this.x, this.y);
       }
 
       // Despawn once fully past the downstream screen edge (along gravity)
@@ -664,7 +792,7 @@ class Droplet {
 }
 
 // ── Simulation ────────────────────────────────────────────────────────────────
-let droplets = [];
+let droplets = [], rivulets = [];
 
 function spawnAt(x, y, r) {
   if (r === undefined) {
@@ -672,23 +800,30 @@ function spawnAt(x, y, r) {
     const rnd = Math.pow(Math.random(), 2.4);
     r = CFG.minR + rnd * (CFG.maxR - CFG.minR);
   }
-  // Every spawn is a real, simulated drop now — even the tiny ones. They persist,
-  // merge, grow and (if small and isolated) evaporate. No ephemeral bead layer.
+  // Tiny drops don't move, wobble or react — bake them into the static mist
+  // layer (zero per-frame cost, never fades) instead of simulating them.
+  if (r < MIST_R) { addMist(x, y, r); return; }
   if (droplets.length >= CFG.maxDroplets) {
-    // Don't hard-stop the rain at the cap: evict the smallest STATIC drop to
-    // make room (only if it's smaller than the newcomer, so we keep the
-    // interesting ones). This keeps rain always falling with gentle turnover.
+    // Never hard-stop the rain at the cap: demote the smallest static drop
+    // into the mist layer. Its pixels stay on the glass exactly where it was
+    // (it just stops being simulated), and the freed slot takes the newcomer.
     let mi = -1, mr = Infinity;
     for (let i = 0; i < droplets.length; i++) {
       const d = droplets[i];
       if (d.falling || d.r >= mr) continue;
       mr = d.r; mi = i;
     }
-    if (mi < 0 || mr >= r) return;   // nothing smaller to evict → skip this spawn
+    if (mi < 0) return;              // everything is falling (vanishingly rare)
+    const dm = droplets[mi];
+    addMist(dm.x, dm.y, dm.r);
     droplets[mi] = droplets[droplets.length - 1];
     droplets.pop();
   }
-  droplets.push(new Droplet(x, y, r));
+  const d = new Droplet(x, y, r);
+  // Landing on existing mist: swallow the beads underneath (wipe + grow)
+  const vol = takeMist(x, y, x, y, r * 0.9);
+  if (vol > 0) d.r = Math.cbrt(d.r * d.r * d.r + vol);
+  droplets.push(d);
 }
 
 function randomSpawn() {
@@ -753,8 +888,10 @@ function frame(ts) {
   const dt = lastTs ? Math.min((ts - lastTs) / 16.667, 2.5) : 1;
   lastTs = ts;
 
-  // Support spawnProb > 1 by spawning Math.floor(prob) times + fractional chance
-  if (droplets.length < CFG.maxDroplets) {
+  // Support spawnProb > 1 by spawning Math.floor(prob) times + fractional chance.
+  // No cap gate here — spawnAt itself demotes a static drop to mist when full,
+  // so the rain never stops.
+  {
     const st = CFG.spawnProb * dt;
     const sn = Math.floor(st) + (Math.random() < (st % 1) ? 1 : 0);
     for (let i = 0; i < sn; i++) randomSpawn();
@@ -763,13 +900,27 @@ function frame(ts) {
   for (const d of droplets) d.update(dt);
   processMerges();
 
-  // Cull dead
-  droplets = droplets.filter(d => !d.dead);
+  // Cull dead; orphaned rivulets finish draining on their own
+  droplets = droplets.filter(d => {
+    if (d.dead && d.rivulet) d.rivulet.done = true;
+    return !d.dead;
+  });
+
+  // Rivulets: drain from the top, deposit beads, drop empties
+  for (let i = rivulets.length - 1; i >= 0; i--) {
+    if (rivulets[i].update(dt)) {
+      rivulets[i] = rivulets[rivulets.length - 1];
+      rivulets.pop();
+    }
+  }
 
   // ── Render ───────────────────────────────────────────────────────────────
   drawBg();
+  ctx.drawImage(mistCvs, 0, 0);          // static mist: thousands of beads, one blit
 
   for (const s of streaks) { s.update(); s.draw(); }
+
+  for (const rv of rivulets) rv.draw();
 
   // Short tails behind running drops (drawn before the drops themselves)
   for (const d of droplets)
@@ -902,13 +1053,15 @@ function resizeCanvases() {
   // clientWidth/Height が UA の各種バー込みでも正確なビューポートサイズを返す
   W = canvas.width  = document.documentElement.clientWidth  || window.innerWidth;
   H = canvas.height = document.documentElement.clientHeight || window.innerHeight;
+  mistCvs.width = W; mistCvs.height = H;   // resizing clears it…
+  redrawMist();                             // …so repaint the recorded beads
 }
 
 function init() {
   resizeCanvases();
   updateBgCvs();
   streaks  = Array.from({ length: CFG.numStreaks }, () => new Streak(true));
-  droplets = [];
+  droplets = []; rivulets = [];
   for (let i = 0; i < 28; i++) randomSpawn();
 }
 
