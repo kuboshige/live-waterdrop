@@ -79,7 +79,7 @@ input[type=range]{width:100%;cursor:pointer;accent-color:#5aaed4}
 
 // Bump this every deploy so it's obvious which build is actually loaded
 // (open ⚙ to see it, or the console). Helps catch stale browser caching.
-const BUILD = '2026-07-07b · tilt+power-save';
+const BUILD = '2026-07-08 · linear-mobility+mass-loss';
 console.log('Rain on Glass — build:', BUILD);
 
 // Network-first service worker: always loads the freshest deploy when online,
@@ -243,7 +243,7 @@ const CFG = {
   minR:           1.8,
   maxR:           6.0,
   fallThresh:     10,
-  gravity:        0.34,
+  mobility:       0.09,  // linear mobility law: v∞ = mobility·(r²·g − fallThresh²)
   maxSpeed:       30,
   maxDroplets:    360,
   numStreaks:     16,
@@ -889,36 +889,33 @@ class Droplet {
 
     if (this.falling) {
       const excess = this.r - CFG.fallThresh;
-      // Quadratic speed scaling — big/heavy drops reach much higher top speeds.
-      // Scaled by gStrength: on a tilted screen runs are slower; laid flat they
-      // stop (vMax→~0 clamps any residual motion to a halt).
-      const vMax = Math.min(CFG.maxSpeed, Math.max(1.5, excess * excess * 0.16 + excess * 0.7))
-                 * Math.max(0.04, gStrength);
+      // Linear mobility law (experiments: Ca ∝ Bo − Bo_c). Terminal speed rises
+      // LINEARLY with how much the drive (mass × in-plane gravity, ∝ r²·g here)
+      // exceeds the pinning force — not with a quadratic cap. Just-released
+      // drops crawl; big drops glide; tilting the phone scales the whole law.
+      const pinF = CFG.fallThresh * CFG.fallThresh;
+      const vInf = Math.min(CFG.maxSpeed,
+        CFG.mobility * Math.max(0, this.r * this.r * gStrength - pinF));
 
-      // Stick-slip: larger drops have much less sticking (hydrophobic surface)
+      // Stick-slip only near threshold — fast drops glide continuously
+      // (slow drops jerk, fast drops flow: a one-parameter crossover).
       this.slipPhase = (this.slipPhase + dt) % this.slipPeriod;
-      const slipRatio = Math.max(0.06, 0.24 - excess * 0.014);
+      const slipRatio = Math.max(0.05, 0.26 - vInf * 0.02);
       const sticking  = this.slipPhase < this.slipPeriod * slipRatio;
-      const gravMul   = sticking ? 0.05 : 1.0;
-      const drag      = sticking ? Math.pow(0.82, dt) : 1.0;
-      // Mass feel: a little sluggish at first, but the penalty is mild so heavy
-      // drops actually build up real speed rather than crawling.
-      const massMul   = Math.max(0.78, 1 - excess * 0.012);
+      const vTarget   = sticking ? vInf * 0.12 : vInf;
 
-      // Accelerate along the gravity vector. Velocity is split into the
-      // along-gravity component (gets drag + gravity + the speed cap) and the
-      // perpendicular component (wander / attraction). This already works for
-      // ANY GRAV direction — only the live accelerometer feed remains to add.
+      // Relax toward terminal speed. τ grows with size: real drops reach their
+      // steady speed in ~0.1s·(r/1mm) — that IS the "mass feel".
+      const tau = 6 + this.r * 0.35;
       let vAlong = this.vx * GRAV.x + this.vy * GRAV.y;
       const vpx = this.vx - vAlong * GRAV.x, vpy = this.vy - vAlong * GRAV.y;
-      vAlong = vAlong * drag + CFG.gravity * gStrength * gravMul * massMul * dt;
-      if (vAlong > vMax) vAlong = vMax;
+      vAlong += (vTarget - vAlong) * Math.min(1, dt / tau);
       this.vx = vpx + vAlong * GRAV.x;
       this.vy = vpy + vAlong * GRAV.y;
 
       // Meander: gentle lateral wander, and it fades to ~nothing for big drops
       // — a heavy drop just barrels straight down under its own weight.
-      const wobAmp = 0.016 * Math.max(0.08, 1 - excess * 0.06);
+      const wobAmp = 0.016 * Math.min(1, Math.max(0.08, 1 - excess * 0.06));
       this.vx += (Math.sin(this.age * this.wanderF)
                 + Math.sin(this.age * this.wanderF * 2.3) * 0.5) * wobAmp * dt;
 
@@ -960,10 +957,29 @@ class Droplet {
           this.rivulet.sever();
       }
 
-      // Settle: if gravity is too weak to keep it running (phone near-flat) and
-      // it has essentially stopped, it becomes a static drop again so it can
-      // pool and merge with its neighbours instead of hanging mid-screen.
-      if (gStrength < 0.14 && speed < 0.4) { this.falling = false; this.rivulet = null; }
+      // Mass-loss trail: a runner sheds water into its wet track and slows —
+      // on clean glass it starves; over dense mist the meals outweigh the loss
+      // and it keeps going (the window "some runs die halfway" behaviour).
+      if (speed > 1) {
+        const shed = 0.40 * this.r * speed * dt;             // volume, r³ units
+        this.r = Math.cbrt(Math.max(8, this.r ** 3 - shed));
+      }
+
+      // Re-pin: if the (shrunken or tilt-weakened) drive can no longer beat the
+      // pinning force and the drop has stalled, it pins where it is. Restarting
+      // is harder than sustaining (contact line relaxes) → pinExtra grows.
+      // Its thread's water then catches up and drains into the re-pinned drop.
+      if (vInf <= 1.2 && speed < 1.5) {
+        this.falling  = false;
+        this.pinExtra = Math.min(6, this.pinExtra + 1.6);
+        if (this.rivulet) {
+          this.rivulet.done = true;
+          this.rivulet.draining = true;
+          this.rivulet.bead = this;
+          this.rivulet.headX = null;
+          this.rivulet = null;
+        }
+      }
 
       // Despawn once fully past the downstream screen edge (along gravity)
       if ((GRAV.y > 0 && this.y - this.r > H) || (GRAV.y < 0 && this.y + this.r < 0) ||
