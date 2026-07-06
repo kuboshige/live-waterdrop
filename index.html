@@ -79,7 +79,7 @@ input[type=range]{width:100%;cursor:pointer;accent-color:#5aaed4}
 
 // Bump this every deploy so it's obvious which build is actually loaded
 // (open ⚙ to see it, or the console). Helps catch stale browser caching.
-const BUILD = '2026-07-05c · drop-on-thread absorb';
+const BUILD = '2026-07-06 · mist-ghost-fix+momentum';
 console.log('Rain on Glass — build:', BUILD);
 
 // Network-first service worker: always loads the freshest deploy when online,
@@ -412,12 +412,17 @@ function redrawMist() {
   for (const m of mist) if (!m.dead) paintMist(m.x, m.y, m.r);
 }
 
-// Absorb every mist bead within `rad` of the segment (px,py)→(x,y): wipe the
-// pixels (destination-out capsule) and return the total absorbed volume (Σr³).
+// Absorb every mist bead within `rad` of the segment (px,py)→(x,y).
+// The hit-box sits a little OUTSIDE the bead's image (MARGIN) so a graze still
+// counts, and EACH swallowed bead is erased by its own circle (radius m.r+1.5)
+// — never a path capsule that could clip a bead's edge and leave a ghost
+// crescent behind. Returns total absorbed volume (Σr³).
+const MIST_HIT_MARGIN = 2.5;
 function takeMist(px, py, x, y, rad) {
-  let vol = 0;
-  const x0 = Math.min(px, x) - rad - 4, x1 = Math.max(px, x) + rad + 4;
-  const y0 = Math.min(py, y) - rad - 4, y1 = Math.max(py, y) + rad + 4;
+  let vol = 0, hit = false;
+  const R = rad + MIST_HIT_MARGIN;
+  const x0 = Math.min(px, x) - R - 8, x1 = Math.max(px, x) + R + 8;
+  const y0 = Math.min(py, y) - R - 8, y1 = Math.max(py, y) + R + 8;
   for (let gx = Math.floor(x0 / MIST_CELL); gx <= Math.floor(x1 / MIST_CELL); gx++)
     for (let gy = Math.floor(y0 / MIST_CELL); gy <= Math.floor(y1 / MIST_CELL); gy++) {
       const c = mistGrid.get(gx + ',' + gy);
@@ -425,26 +430,22 @@ function takeMist(px, py, x, y, rad) {
       for (const i of c) {
         const m = mist[i];
         if (!m || m.dead) continue;
-        if (segDist(px, py, x, y, m.x, m.y) < rad + m.r) {
-          m.dead = true;
+        if (segDist(px, py, x, y, m.x, m.y) < R + m.r) {
+          m.dead = true; hit = true;
           vol += m.r * m.r * m.r;
+          eraseMistCircle(m.x, m.y, m.r + 1.5);   // fully remove THIS bead's pixels
         }
       }
     }
-  // Erase pixels only when something was actually swallowed (or the record
-  // table is saturated and pixel-only beads may exist). Touching the mist
-  // canvas invalidates its GPU texture, so an unconditional per-frame stroke
-  // for every falling drop would force a full re-upload every frame.
-  if (vol > 0 || mist.length >= MIST_MAX) {
+  // When the record table is saturated, pixel-only beads exist with no record —
+  // wipe the swept path too so they can't linger. (Rare; only near MIST_MAX.)
+  if (mist.length >= MIST_MAX) {
     mistCtx.save();
     mistCtx.globalCompositeOperation = 'destination-out';
     mistCtx.lineCap = 'round';
-    mistCtx.lineWidth = rad * 2;
+    mistCtx.lineWidth = (rad + 2) * 2;
     mistCtx.strokeStyle = '#000';
-    mistCtx.beginPath();
-    mistCtx.moveTo(px, py);
-    mistCtx.lineTo(x, y);
-    mistCtx.stroke();
+    mistCtx.beginPath(); mistCtx.moveTo(px, py); mistCtx.lineTo(x, y); mistCtx.stroke();
     mistCtx.restore();
   }
   return vol;
@@ -466,6 +467,7 @@ class Rivulet {
     this.headX = null; this.headY = null;  // live attachment point (drop centre)
     this.owner = null;                     // the drop currently laying it (live)
     this.ownerR = 0;                       // drop radius, for neck sizing
+    this.ownerV = 0;                       // drop speed, for neck thickness/length
     this.draining = false;                 // orphan mode: recede → feed the bead
     this.bead = null;                      // tracked Droplet growing at the tail
     this.drainAcc = 0;
@@ -506,11 +508,13 @@ class Rivulet {
     this.pts = this.pts.slice(k);   // lower part (junction point k first)
     return true;
   }
-  record(x, y, r) {
-    this.headX = x; this.headY = y; this.ownerR = r;
+  record(x, y, r, speed) {
+    this.headX = x; this.headY = y; this.ownerR = r; this.ownerV = speed || 0;
     const last = this.pts[this.pts.length - 1];
     if (last && Math.hypot(x - last.x, y - last.y) < 5) return;
-    this.pts.push({ x, y, ttl: 60 + Math.random() * 55 });
+    // Faster fall ⇒ the thread's water lingers longer before drying, so the
+    // thick root extends further up the trail.
+    this.pts.push({ x, y, ttl: (60 + Math.random() * 55) * (1 + (speed || 0) * 0.06) });
   }
   // Detach from the owner drop: the thread's water now drains into a bead
   // born at the thread's lower end.
@@ -576,7 +580,11 @@ class Rivulet {
     const n = this.pts.length;
     if (n === 0) return;
     const live = this.headX !== null;
-    const neckLen = this.ownerR * 2.6;
+    // Faster fall ⇒ thicker root AND a longer thick section (more water is
+    // being dragged out of the drop). Both scale with the owner's speed.
+    const vf = Math.min(2.4, 1 + this.ownerV * 0.10);
+    const neckLen  = this.ownerR * 2.6 * vf;
+    const rootW    = this.ownerR * 1.05 * vf;
     ctx.save();
     ctx.lineCap = 'round';
     for (let pass = 0; pass < 2; pass++) {
@@ -585,21 +593,21 @@ class Rivulet {
         : 'rgba(255,255,255,0.30)';
       for (let i = 1; i < n; i++) {
         const a = this.pts[i - 1], b = this.pts[i];
-        let w = Math.max(0.5, Math.min(2.0, Math.min(a.ttl, b.ttl) * 0.04));
+        let w = Math.max(0.5, Math.min(2.2, Math.min(a.ttl, b.ttl) * 0.04));
         if (live) {
           const dh = Math.hypot(b.x - this.headX, b.y - this.headY);
           if (dh < neckLen) {
             const t = 1 - dh / neckLen;
-            w += t * t * this.ownerR * 1.05;   // quadratic meniscus flare
+            w += t * t * rootW;                // quadratic meniscus flare
           }
         }
         ctx.lineWidth = pass === 0 ? w : Math.max(0.35, w * 0.42);
         ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
       }
-      // Connect the newest point to the drop centre, at full neck width
+      // Connect the newest point to the drop centre, at full root width
       if (live) {
         const last = this.pts[n - 1];
-        const w = Math.min(this.ownerR * 1.05, 2.0 + this.ownerR * 0.9);
+        const w = Math.min(rootW, 2.0 + this.ownerR * 1.4);
         ctx.lineWidth = pass === 0 ? w : w * 0.42;
         ctx.beginPath(); ctx.moveTo(last.x, last.y); ctx.lineTo(this.headX, this.headY); ctx.stroke();
       }
@@ -757,10 +765,18 @@ class Droplet {
   }
 
   absorb(o) {
-    const v1 = this.r * this.r * this.r;
+    const v1 = this.r * this.r * this.r;   // mass ∝ volume ∝ r³
     const v2 = o.r   * o.r   * o.r;
     const vt = v1 + v2;
-    if (!this.falling) {
+    // Perfectly inelastic collision: the two stick, so total momentum is
+    // conserved into the merged drop (mass-weighted average velocity).
+    this.vx = (this.vx * v1 + o.vx * v2) / vt;
+    this.vy = (this.vy * v1 + o.vy * v2) / vt;
+    if (this.falling) {
+      // …and the running drop's path bends toward the partner it just swallowed
+      this.vx += (o.x - this.x) * 0.05 * (v2 / vt);
+    } else {
+      // static merge: centroid shifts toward the larger drop (r⁵ weighting)
       const w1 = v1 * this.r * this.r, w2 = v2 * o.r * o.r, wt = w1 + w2;
       this.x = (this.x * w1 + o.x * w2) / wt;
       this.y = (this.y * w1 + o.y * w2) / wt;
@@ -775,7 +791,6 @@ class Droplet {
       this.oscPhase = 0;
       this.oscFreq  = (Math.PI * 2) / (6 + this.r * 0.25);  // bigger = a bit slower
     }
-    if (o.vy > this.vy) this.vy = o.vy * 0.45;
     o.dead = true;
     // The merged, larger footprint swallows any mist beads now underneath it
     const mv = takeMist(this.x, this.y, this.x, this.y, this.r * 0.9);
@@ -832,9 +847,11 @@ class Droplet {
       this.vx = vpx + vAlong * GRAV.x;
       this.vy = vpy + vAlong * GRAV.y;
 
-      // Meander: low-frequency lateral wander so the run isn't a straight line
+      // Meander: gentle lateral wander, and it fades to ~nothing for big drops
+      // — a heavy drop just barrels straight down under its own weight.
+      const wobAmp = 0.016 * Math.max(0.08, 1 - excess * 0.06);
       this.vx += (Math.sin(this.age * this.wanderF)
-                + Math.sin(this.age * this.wanderF * 2.3) * 0.5) * 0.03 * dt;
+                + Math.sin(this.age * this.wanderF * 2.3) * 0.5) * wobAmp * dt;
 
       // Attraction: gently veer toward the nearest static drop just ahead so the
       // run "reaches out" and swallows it (only scans while falling — cheap).
@@ -858,18 +875,10 @@ class Droplet {
       this.vx = pxv + al * GRAV.x;
       this.vy = pyv + al * GRAV.y;
 
-      // Sweep: absorb the mist along the swept path — the pixels are wiped
-      // clean and their volume feeds this drop, so it grows as it runs.
-      // No speed gate: even a slowly creeping drop swallows what it touches.
       const speed = Math.hypot(this.vx, this.vy);
-      {
-        const vol = takeMist(this.px, this.py, this.x, this.y, this.r * 0.95);
-        if (vol > 0) this.r = Math.cbrt(this.r * this.r * this.r + vol);
-      }
       // Rivulet: a big fast drop starts laying a thin water thread, and keeps
       // laying it (even through slow stick phases) so the thread is never
-      // detached from the drop. Occasionally the thread snaps mid-way — the
-      // severed upper part drains into a bead at its lower end.
+      // detached from the drop. Occasionally the thread snaps mid-way.
       if (!this.rivulet && this.r >= CFG.trailMinR && speed >= CFG.trailMinSpeed
           && rivulets.length < 14) {
         this.rivulet = new Rivulet();
@@ -877,7 +886,7 @@ class Droplet {
         rivulets.push(this.rivulet);
       }
       if (this.rivulet) {
-        this.rivulet.record(this.x, this.y, this.r);
+        this.rivulet.record(this.x, this.y, this.r, speed);
         if (this.rivulet.pts.length > 20 && Math.random() < 0.006 * dt)
           this.rivulet.sever();
       }
@@ -886,17 +895,17 @@ class Droplet {
       if ((GRAV.y > 0 && this.y - this.r > H) || (GRAV.y < 0 && this.y + this.r < 0) ||
           (GRAV.x > 0 && this.x - this.r > W) || (GRAV.x < 0 && this.x + this.r < 0))
         this.dead = true;
-    } else if (this.age % 24 < dt) {
-      // Static drops periodically sweep their own footprint (staggered by the
-      // random birth age): whatever mist ended up underneath gets swallowed —
-      // no matter how it got there. Belt-and-braces for "covered but unmerged".
-      const vol = takeMist(this.x, this.y, this.x, this.y,
-                           Math.max(this.shRx, this.shRy) * 0.95);
-      if (vol > 0) this.r = Math.cbrt(this.r * this.r * this.r + vol);
     }
 
+    // Eat the mist under this drop EVERY frame (moving or still): the hit-box is
+    // the full deformed footprint plus a margin, so a wobbling/creeping/covering
+    // drop always swallows the beads beneath it. One unified path — no gaps.
+    this.computeShape();
+    const eatR = Math.max(this.shRx, this.shRy) + 1.5;
+    const mv = takeMist(this.px, this.py, this.x, this.y, eatR);
+    if (mv > 0) { this.r = Math.cbrt(this.r * this.r * this.r + mv); this.computeShape(); }
+
     this.px = this.x; this.py = this.y;
-    this.computeShape();   // cache the visual ellipse for this frame's collisions
   }
 
   draw() {
