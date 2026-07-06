@@ -79,7 +79,7 @@ input[type=range]{width:100%;cursor:pointer;accent-color:#5aaed4}
 
 // Bump this every deploy so it's obvious which build is actually loaded
 // (open ⚙ to see it, or the console). Helps catch stale browser caching.
-const BUILD = '2026-07-07a · tilt-gravity';
+const BUILD = '2026-07-07b · tilt+power-save';
 console.log('Rain on Glass — build:', BUILD);
 
 // Network-first service worker: always loads the freshest deploy when online,
@@ -1170,8 +1170,14 @@ document.addEventListener('visibilitychange', () => {
   if (!document.hidden) { lastTs = 0; requestAnimationFrame(frame); }
 });
 
+// Power-save (省電力): process every OTHER vsync → ~30fps at half the CPU/GPU.
+// Skipped frames don't touch lastTs, so dt doubles and simulation speed is
+// unchanged — the motion just updates at half rate.
+let powerSave = false, psFlip = false;
+
 function frame(ts) {
   if (document.hidden) return; // screen off / minimized — stop drawing
+  if (powerSave && (psFlip = !psFlip)) { requestAnimationFrame(frame); return; }
   if (DEBUG) frameT0 = performance.now();
   const dt = lastTs ? Math.min((ts - lastTs) / 16.667, 2.5) : 1;
   lastTs = ts;
@@ -1216,7 +1222,7 @@ function frame(ts) {
   ctx.drawImage(mistCvs, 0, 0);          // static mist: thousands of beads, one blit
   P('bg', t);
 
-  for (const s of streaks) { s.update(); s.draw(); }
+  if (!powerSave) for (const s of streaks) { s.update(); s.draw(); }
 
   for (const rv of rivulets) rv.draw();
 
@@ -1343,6 +1349,25 @@ document.getElementById('spawnSlider').addEventListener('input', e => {
       disableTilt();
       b.textContent = '📱 傾きで流す：OFF';
     }
+  });
+  row.appendChild(b);
+  settingsPanel.appendChild(row);
+})();
+
+// Power-save toggle: 30fps + no rain streaks — for all-day live-wallpaper use
+(() => {
+  const row = document.createElement('div');
+  row.className = 'srow';
+  const b = document.createElement('button');
+  b.id = 'powerBtn';
+  b.textContent = '🔋 省電力モード：OFF';
+  b.style.cssText =
+    'width:100%;padding:7px 0;border-radius:8px;background:rgba(255,255,255,0.10);'
+    + 'border:1px solid rgba(255,255,255,0.20);color:#ddeef8;'
+    + 'font:13px system-ui,sans-serif;cursor:pointer';
+  b.addEventListener('click', () => {
+    powerSave = !powerSave;
+    b.textContent = powerSave ? '🔋 省電力モード：ON（30fps）' : '🔋 省電力モード：OFF';
   });
   row.appendChild(b);
   settingsPanel.appendChild(row);
