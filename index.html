@@ -79,7 +79,7 @@ input[type=range]{width:100%;cursor:pointer;accent-color:#5aaed4}
 
 // Bump this every deploy so it's obvious which build is actually loaded
 // (open ⚙ to see it, or the console). Helps catch stale browser caching.
-const BUILD = '2026-07-06b · sw-nocache-fix+refresh-btn';
+const BUILD = '2026-07-06c · bead-sprite+perf+faster-fall';
 console.log('Rain on Glass — build:', BUILD);
 
 // Network-first service worker: always loads the freshest deploy when online,
@@ -105,6 +105,10 @@ if (DEBUG) {
     + 'border-radius:6px;pointer-events:none;white-space:pre';
   document.body.appendChild(hudEl);
 }
+// Per-phase profiler (debug only). P('name', t0) records elapsed since t0 into
+// an exponential moving average so the HUD can show where the frame goes.
+const prof = {};
+function P(name, t0) { if (DEBUG) prof[name] = (prof[name] || 0) * 0.9 + (performance.now() - t0) * 0.1; }
 function updateHud(dt) {
   const ms = performance.now() - frameT0;
   msBuf.push(ms);  if (msBuf.length  > 60) msBuf.shift();
@@ -112,11 +116,13 @@ function updateHud(dt) {
   const avg = a => a.reduce((s, v) => s + v, 0) / a.length;
   const mx  = a => a.reduce((s, v) => Math.max(s, v), 0);
   const modes = ['normal', 'stripes', 'checker', 'white'];
+  const pf = Object.keys(prof).map(k => `${k} ${prof[k].toFixed(1)}`).join('  ');
   hudEl.textContent =
     `FPS ${avg(fpsBuf).toFixed(0)}\n` +
     `ms  ${avg(msBuf).toFixed(1)} / max ${mx(msBuf).toFixed(1)}\n` +
     `drops ${droplets.length}  mist ${mist.length}  riv ${rivulets.length}\n` +
-    `bg ${bgDark ? 'dark' : 'light'}${bgHasImg ? ' img' : ''}  test ${modes[testBgMode]}`;
+    `bg ${bgDark ? 'dark' : 'light'}${bgHasImg ? ' img' : ''}  test ${modes[testBgMode]}\n` +
+    pf;
 }
 
 // Hydrophobic surface: a running drop leaves NO lasting ridge — only a short,
@@ -236,8 +242,8 @@ const CFG = {
   minR:           1.8,
   maxR:           6.0,
   fallThresh:     10,
-  gravity:        0.22,
-  maxSpeed:       22,
+  gravity:        0.34,
+  maxSpeed:       30,
   maxDroplets:    360,
   numStreaks:     16,
   refrMag:        1.65,
@@ -246,7 +252,7 @@ const CFG = {
   // Rivulet gate: only drops at least trailMinR big AND moving at least
   // trailMinSpeed leave the thin draining water-thread behind them.
   trailMinR:      12,
-  trailMinSpeed:  7,
+  trailMinSpeed:  6,
 };
 
 // Gravity direction as a UNIT vector. Right now it points straight down the
@@ -286,8 +292,8 @@ function drawBg() {
 // the edge compresses the image like a real water lens. Rings are drawn outer→
 // inner; each inner disc overdraws the previous one, so the visible magnification
 // steps up as you move outward. Must be called INSIDE the drop's clip.
-const RING_FRAC = [1.00, 0.72, 0.48, 0.26];
-const RING_MAG  = [2.15, 1.75, 1.42, 1.18];
+const RING_FRAC = [1.00, 0.64, 0.32];
+const RING_MAG  = [2.10, 1.62, 1.20];
 function refractRings(x, y, rx, ry) {
   for (let k = 0; k < RING_FRAC.length; k++) {
     ctx.save();
@@ -318,22 +324,34 @@ const mistGrid = new Map();    // "gx,gy" → indices into mist
 
 function mistKey(x, y) { return ((x / MIST_CELL) | 0) + ',' + ((y / MIST_CELL) | 0); }
 
+// A single high-res "water bead" sprite, drawn once and stamped for every mist
+// bead AND every tiny tracked drop — so mist and drops share one look (no more
+// grey mist) and painting a bead is one drawImage instead of 3 canvas ops.
+const beadSprite = document.createElement('canvas');
+const BEAD_S = 48;
+function buildBeadSprite() {
+  beadSprite.width = BEAD_S; beadSprite.height = BEAD_S;
+  const c = beadSprite.getContext('2d');
+  c.clearRect(0, 0, BEAD_S, BEAD_S);
+  const cx = BEAD_S / 2, cy = BEAD_S / 2, R = BEAD_S / 2 - 3;
+  // Clear-ish lens body: transparent centre → faint edge, so background shows
+  // through the middle and it reads as water, not a solid grey disc.
+  const bg = c.createRadialGradient(cx, cy, R * 0.2, cx, cy, R);
+  if (bgDark) { bg.addColorStop(0, 'rgba(232,244,254,0.04)'); bg.addColorStop(1, 'rgba(232,244,254,0.16)'); }
+  else        { bg.addColorStop(0, 'rgba(18,38,58,0.03)');    bg.addColorStop(1, 'rgba(18,38,58,0.15)'); }
+  c.fillStyle = bg;
+  c.beginPath(); c.arc(cx, cy, R, 0, Math.PI * 2); c.fill();
+  // Upper specular highlight (same as the drops)
+  c.beginPath(); c.arc(cx - R * 0.28, cy - R * 0.34, R * 0.34, 0, Math.PI * 2);
+  c.fillStyle = 'rgba(255,255,255,0.55)'; c.fill();
+  // Dark rim
+  c.beginPath(); c.arc(cx, cy, R, 0, Math.PI * 2);
+  c.strokeStyle = 'rgba(8,22,42,0.42)'; c.lineWidth = 1.3; c.stroke();
+}
+
 function paintMist(x, y, r) {
-  mistCtx.beginPath();
-  mistCtx.arc(x, y, r, 0, Math.PI * 2);
-  mistCtx.fillStyle = bgDark ? 'rgba(220,236,250,0.10)' : 'rgba(24,44,64,0.11)';
-  mistCtx.fill();
-  if (r > 1.6) {
-    mistCtx.beginPath();
-    mistCtx.arc(x - r * 0.2, y - r * 0.28, Math.max(0.5, r * 0.32), 0, Math.PI * 2);
-    mistCtx.fillStyle = 'rgba(255,255,255,0.45)';
-    mistCtx.fill();
-  }
-  mistCtx.beginPath();
-  mistCtx.arc(x, y, r, 0, Math.PI * 2);
-  mistCtx.strokeStyle = 'rgba(10,25,45,0.34)';
-  mistCtx.lineWidth = 0.5;
-  mistCtx.stroke();
+  const s = r * 1.18;   // sprite radius ≈ bead radius (rim sits at the edge)
+  mistCtx.drawImage(beadSprite, x - s, y - s, s * 2, s * 2);
 }
 
 function eraseMistCircle(x, y, rad) {
@@ -355,7 +373,7 @@ function addMist(x, y, r, raw) {
     for (const d of droplets) {
       if (d.dead) continue;
       const dx = d.x - x, dy = d.y - y;
-      const reach = Math.max(d.shRx, d.shRy) * 0.95 + r * 1.3;
+      const reach = Math.max(d.shRx, d.shRy) * 0.98 + r * 0.7;
       if (dx * dx + dy * dy < reach * reach) {
         d.r = Math.cbrt(d.r * d.r * d.r + r * r * r);
         d.computeShape();
@@ -374,7 +392,7 @@ function addMist(x, y, r, raw) {
           const m = mist[i];
           if (!m || m.dead) continue;
           const dx = m.x - x, dy = m.y - y;
-          const rr = (m.r + r) * 1.2 + 0.8;      // slightly proud hit-box
+          const rr = (m.r + r) * 1.05 + 0.4;     // hit-box just past the rims
           if (dx * dx + dy * dy >= rr * rr) continue;
           const v1 = m.r ** 3, v2 = r ** 3, vt = v1 + v2;
           const nx = (m.x * v1 + x * v2) / vt, ny = (m.y * v1 + y * v2) / vt;
@@ -408,6 +426,7 @@ function compactMist() {
 }
 
 function redrawMist() {
+  buildBeadSprite();                 // sprite palette depends on bgDark
   mistCtx.clearRect(0, 0, W, H);
   for (const m of mist) if (!m.dead) paintMist(m.x, m.y, m.r);
 }
@@ -417,7 +436,7 @@ function redrawMist() {
 // counts, and EACH swallowed bead is erased by its own circle (radius m.r+1.5)
 // — never a path capsule that could clip a bead's edge and leave a ghost
 // crescent behind. Returns total absorbed volume (Σr³).
-const MIST_HIT_MARGIN = 2.5;
+const MIST_HIT_MARGIN = 1.2;
 function takeMist(px, py, x, y, rad) {
   let vol = 0, hit = false;
   const R = rad + MIST_HIT_MARGIN;
@@ -554,6 +573,7 @@ class Rivulet {
         if (this.bead) {                          // pour the segment into the bead
           const vol = L * 1.15;                   // thread cross-section fudge
           this.bead.r = Math.cbrt(this.bead.r ** 3 + vol);
+          this.bead.computeShape();
         }
         this.pts.shift();
       }
@@ -760,8 +780,8 @@ class Droplet {
     if (d2 > quick * quick) return false;
     const d  = Math.sqrt(d2) || 1e-4;
     const ux = dx / d, uy = dy / d;
-    // +1.2px: the drawn dark rim sits just outside the fill — rims touch = merge
-    return d < this.radiusAlong(ux, uy) + o.radiusAlong(ux, uy) + 1.2;
+    // +0.5px: hit-box sits right at the drawn rim (narrowed from the old +1.2)
+    return d < this.radiusAlong(ux, uy) + o.radiusAlong(ux, uy) + 0.5;
   }
 
   absorb(o) {
@@ -823,8 +843,8 @@ class Droplet {
 
     if (this.falling) {
       const excess = this.r - CFG.fallThresh;
-      // Quadratic speed scaling — large drops accelerate dramatically
-      const vMax = Math.min(CFG.maxSpeed, Math.max(1.5, excess * excess * 0.10 + excess * 0.40));
+      // Quadratic speed scaling — big/heavy drops reach much higher top speeds
+      const vMax = Math.min(CFG.maxSpeed, Math.max(1.5, excess * excess * 0.16 + excess * 0.7));
 
       // Stick-slip: larger drops have much less sticking (hydrophobic surface)
       this.slipPhase = (this.slipPhase + dt) % this.slipPeriod;
@@ -832,9 +852,9 @@ class Droplet {
       const sticking  = this.slipPhase < this.slipPeriod * slipRatio;
       const gravMul   = sticking ? 0.05 : 1.0;
       const drag      = sticking ? Math.pow(0.82, dt) : 1.0;
-      // Mass feel: bigger drops accelerate more sluggishly (heavier) even though
-      // their top speed is higher — so they start slow and build up weightily.
-      const massMul   = Math.max(0.55, 1 - excess * 0.02);
+      // Mass feel: a little sluggish at first, but the penalty is mild so heavy
+      // drops actually build up real speed rather than crawling.
+      const massMul   = Math.max(0.78, 1 - excess * 0.012);
 
       // Accelerate along the gravity vector. Velocity is split into the
       // along-gravity component (gets drag + gravity + the speed cap) and the
@@ -901,7 +921,7 @@ class Droplet {
     // the full deformed footprint plus a margin, so a wobbling/creeping/covering
     // drop always swallows the beads beneath it. One unified path — no gaps.
     this.computeShape();
-    const eatR = Math.max(this.shRx, this.shRy) + 1.5;
+    const eatR = Math.max(this.shRx, this.shRy) + 0.5;
     const mv = takeMist(this.px, this.py, this.x, this.y, eatR);
     if (mv > 0) { this.r = Math.cbrt(this.r * this.r * this.r + mv); this.computeShape(); }
 
@@ -909,30 +929,19 @@ class Droplet {
   }
 
   draw() {
-    // Render exactly the ellipse the collision system uses (computeShape)
-    this.computeShape();
+    // Use the ellipse the collision system already cached this frame (update()
+    // and absorb() keep it current) — no need to recompute it here.
     const r = this.shR, sx = this.shSx, sy = this.shSy;
     const rx = this.shRx, ry = this.shRy;
     const rMax = Math.max(rx, ry);
     const x = this.x, y = this.y;
 
-    if (r < 3.2) {
-      // Tiny drop: read as a faint glass bead (rim + small highlight), not a
-      // solid dot — a very light body keeps it from looking like drizzle.
-      ctx.beginPath();
-      ctx.arc(x, y, r, 0, Math.PI * 2);
-      ctx.fillStyle = bgDark ? 'rgba(220,236,250,0.10)' : 'rgba(24,44,64,0.11)';
-      ctx.fill();
-      if (r > 1.6) {                       // tiny upper caustic highlight
-        ctx.beginPath();
-        ctx.arc(x - r * 0.2, y - r * 0.28, Math.max(0.5, r * 0.32), 0, Math.PI * 2);
-        ctx.fillStyle = 'rgba(255,255,255,0.45)';
-        ctx.fill();
-      }
-      ctx.beginPath();
-      ctx.arc(x, y, r, 0, Math.PI * 2);
-      ctx.strokeStyle = 'rgba(10,25,45,0.34)';
-      ctx.lineWidth = 0.5; ctx.stroke();
+    if (r < 5.5) {
+      // Small drop: stamp the shared bead sprite. Identical to the mist (visual
+      // continuity) and far cheaper than live refraction — only drops big
+      // enough to show a real lens (r ≥ 5.5) get the full refractive treatment.
+      const s = r * 1.15;
+      ctx.drawImage(beadSprite, x - s, y - s, s * 2, s * 2);
       return;
     }
 
@@ -999,11 +1008,8 @@ class Droplet {
     hg.addColorStop(0,   'rgba(255,255,255,0.90)');
     hg.addColorStop(0.5, 'rgba(255,255,255,0.32)');
     hg.addColorStop(1,   'rgba(255,255,255,0)');
-    ctx.save();
-    ctx.translate(hx, hy); ctx.scale(1, 0.6); ctx.translate(-hx, -hy);  // wide-not-tall
-    ctx.fillStyle = hg;
-    ctx.beginPath(); ctx.arc(hx, hy, hlr, 0, Math.PI * 2); ctx.fill();
-    ctx.restore();
+    ctx.fillStyle = hg;                                   // ellipse fill: wide-not-tall,
+    ctx.beginPath(); ctx.ellipse(hx, hy, hlr, hlr * 0.6, 0, 0, Math.PI * 2); ctx.fill();
 
     ctx.restore();  // end clip
 
@@ -1125,8 +1131,13 @@ function frame(ts) {
     for (let i = 0; i < sn; i++) randomSpawn();
   }
 
+  let t = performance.now();
   for (const d of droplets) d.update(dt);
+  P('upd', t);
+
+  t = performance.now();
   processMerges();
+  P('mrg', t);
 
   // Cull dead. A dead drop's rivulet is orphaned AFTER the filter — orphan()
   // spawns the drain-bead into droplets, which must not happen mid-filter.
@@ -1146,8 +1157,10 @@ function frame(ts) {
   }
 
   // ── Render ───────────────────────────────────────────────────────────────
+  t = performance.now();
   drawBg();
   ctx.drawImage(mistCvs, 0, 0);          // static mist: thousands of beads, one blit
+  P('bg', t);
 
   for (const s of streaks) { s.update(); s.draw(); }
 
@@ -1158,20 +1171,13 @@ function frame(ts) {
   for (const d of droplets)
     if (d.falling && d.vy > CFG.depositSpeedMin && !d.rivulet) drawTail(d);
 
+  t = performance.now();
   for (const d of droplets) if (!d.falling) d.draw();
   for (const d of droplets) if ( d.falling) d.draw();
+  P('drw', t);
 
-  // Glass top-shine
-  const shine = ctx.createLinearGradient(0, 0, 0, H * 0.07);
-  shine.addColorStop(0, 'rgba(255,255,255,0.052)');
-  shine.addColorStop(1, 'rgba(255,255,255,0)');
-  ctx.fillStyle = shine; ctx.fillRect(0, 0, W, H * 0.07);
-
-  // Vignette
-  const vg = ctx.createRadialGradient(W/2, H/2, H * 0.28, W/2, H/2, H * 0.75);
-  vg.addColorStop(0, 'rgba(0,0,0,0)');
-  vg.addColorStop(1, 'rgba(0,0,0,0.30)');
-  ctx.fillStyle = vg; ctx.fillRect(0, 0, W, H);
+  // Glass top-shine + vignette: static, so pre-rendered once and just blitted
+  if (overlayCvs) ctx.drawImage(overlayCvs, 0, 0);
 
   if (DEBUG) updateHud(dt);
 
@@ -1316,12 +1322,28 @@ document.addEventListener('mousedown', e => {
 });
 
 // ── Resize / Init ─────────────────────────────────────────────────────────────
+let overlayCvs = null;
+function buildOverlay() {
+  overlayCvs = overlayCvs || document.createElement('canvas');
+  overlayCvs.width = W; overlayCvs.height = H;
+  const o = overlayCvs.getContext('2d');
+  const shine = o.createLinearGradient(0, 0, 0, H * 0.07);
+  shine.addColorStop(0, 'rgba(255,255,255,0.052)');
+  shine.addColorStop(1, 'rgba(255,255,255,0)');
+  o.fillStyle = shine; o.fillRect(0, 0, W, H * 0.07);
+  const vg = o.createRadialGradient(W/2, H/2, H * 0.28, W/2, H/2, H * 0.75);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(0,0,0,0.30)');
+  o.fillStyle = vg; o.fillRect(0, 0, W, H);
+}
+
 function resizeCanvases() {
   // clientWidth/Height が UA の各種バー込みでも正確なビューポートサイズを返す
   W = canvas.width  = document.documentElement.clientWidth  || window.innerWidth;
   H = canvas.height = document.documentElement.clientHeight || window.innerHeight;
   mistCvs.width = W; mistCvs.height = H;   // resizing clears it…
   redrawMist();                             // …so repaint the recorded beads
+  buildOverlay();                           // static shine+vignette, blitted per frame
 }
 
 function init() {
