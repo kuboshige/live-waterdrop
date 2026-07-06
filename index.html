@@ -79,7 +79,7 @@ input[type=range]{width:100%;cursor:pointer;accent-color:#5aaed4}
 
 // Bump this every deploy so it's obvious which build is actually loaded
 // (open ⚙ to see it, or the console). Helps catch stale browser caching.
-const BUILD = '2026-07-06d · bead-sprite+perf+faster-fall';
+const BUILD = '2026-07-07 · tilt-gravity';
 console.log('Rain on Glass — build:', BUILD);
 
 // Network-first service worker: always loads the freshest deploy when online,
@@ -121,6 +121,7 @@ function updateHud(dt) {
     `FPS ${avg(fpsBuf).toFixed(0)}\n` +
     `ms  ${avg(msBuf).toFixed(1)} / max ${mx(msBuf).toFixed(1)}\n` +
     `drops ${droplets.length}  mist ${mist.length}  riv ${rivulets.length}\n` +
+    `grav ${GRAV.x.toFixed(2)},${GRAV.y.toFixed(2)} str ${gStrength.toFixed(2)}${tiltOn ? ' tilt' : ''}\n` +
     `bg ${bgDark ? 'dark' : 'light'}${bgHasImg ? ' img' : ''}  test ${modes[testBgMode]}\n` +
     pf;
 }
@@ -255,15 +256,50 @@ const CFG = {
   trailMinSpeed:  6,
 };
 
-// Gravity direction as a UNIT vector. Right now it points straight down the
-// screen; later this will be driven live by the device accelerometer
-// (DeviceOrientation / DeviceMotion) so the rain runs toward real-world "down".
-// Everything gravity-related goes through GRAV — change it and the drops fall
-// that way. setGravity() normalises an arbitrary (ax,ay) into GRAV.
+// Gravity as a UNIT direction (GRAV) plus a STRENGTH (gStrength, 0..1) = how
+// much of full gravity lies in the screen plane. Everything gravity-related
+// goes through these. Default: straight down at full strength (sensor off).
+//   • Phone upright  → in-plane gravity = full  → gStrength ≈ 1, drops run.
+//   • Tilted 45°     → in-plane = g·sin(tilt)   → gStrength ≈ 0.7, slower runs,
+//                      drops must grow bigger before they overcome pinning.
+//   • Flat on table  → in-plane ≈ 0             → gStrength ≈ 0, nothing runs;
+//                      drops just accumulate and merge into big puddles.
 const GRAV = { x: 0, y: 1 };
+let gStrength = 1;
 function setGravity(ax, ay) {
   const m = Math.hypot(ax, ay);
   if (m > 1e-4) { GRAV.x = ax / m; GRAV.y = ay / m; }
+}
+
+// ── Device tilt (accelerometer) ───────────────────────────────────────────────
+let tiltOn = false, gvx = 0, gvy = 9.8;   // low-passed in-plane gravity (canvas frame)
+function onMotion(e) {
+  const a = e.accelerationIncludingGravity;
+  if (!a || (a.x == null)) return;
+  // Device→canvas: canvas x = right (device +x), canvas y = down (device −y).
+  // Water flows ALONG gravity = opposite the at-rest reaction (a) → (−a.x, a.y).
+  let cx = -a.x, cy = a.y;
+  // Compensate for screen rotation so "down the visible screen" stays correct
+  const ang = (((screen.orientation && screen.orientation.angle) || window.orientation || 0)) * Math.PI / 180;
+  if (ang) { const c = Math.cos(ang), s = Math.sin(ang); const rx = cx * c - cy * s, ry = cx * s + cy * c; cx = rx; cy = ry; }
+  gvx += (cx - gvx) * 0.14;   // low-pass (sensor is noisy)
+  gvy += (cy - gvy) * 0.14;
+  const mag = Math.hypot(gvx, gvy);
+  gStrength = Math.min(1, mag / 9.8);
+  if (mag > 1.2) { GRAV.x = gvx / mag; GRAV.y = gvy / mag; }  // keep last dir when ~flat
+}
+async function enableTilt() {
+  try {
+    if (typeof DeviceMotionEvent !== 'undefined' && DeviceMotionEvent.requestPermission) {
+      if (await DeviceMotionEvent.requestPermission() !== 'granted') return false;  // iOS
+    }
+    window.addEventListener('devicemotion', onMotion);
+    tiltOn = true; return true;
+  } catch (e) { return false; }
+}
+function disableTilt() {
+  window.removeEventListener('devicemotion', onMotion);
+  tiltOn = false; gStrength = 1; GRAV.x = 0; GRAV.y = 1; gvx = 0; gvy = 9.8;
 }
 
 // ── Default background ────────────────────────────────────────────────────────
@@ -764,6 +800,13 @@ class Droplet {
       const o = this.osc * Math.sin(this.oscPhase);
       sx *= 1 + o; sy *= 1 - o;
     }
+    // Puddle: laid flat (weak in-plane gravity), a big settled drop slumps —
+    // it spreads a little wider and rounder, like water pooling on level glass.
+    if (!this.falling && gStrength < 0.55 && this.r > 7) {
+      const slump = (1 - gStrength / 0.55) * Math.min(0.22, (this.r - 7) * 0.02);
+      const g = 1 + slump;
+      sx *= g; sy *= g;
+    }
     this.shR = r; this.shSx = sx; this.shSy = sy;
     this.shRx = r * sx; this.shRy = r * sy;
   }
@@ -832,8 +875,11 @@ class Droplet {
       this.osc = 0;
     }
 
-    // Contact-line pinning release
-    if (!this.falling && this.r >= CFG.fallThresh + this.pinExtra) {
+    // Contact-line pinning release. Weaker in-plane gravity (tilt/flat) means a
+    // drop must grow BIGGER before it can overcome pinning and run — so the
+    // release size scales as 1/gStrength. Flat (gStrength≈0) → never releases.
+    const relThresh = CFG.fallThresh / Math.max(0.12, gStrength) + this.pinExtra;
+    if (!this.falling && this.r >= relThresh) {
       this.falling     = true;
       this.pinReleased = true;
       this.vy          = 0.8 + Math.random() * 0.7; // release jerk
@@ -843,8 +889,11 @@ class Droplet {
 
     if (this.falling) {
       const excess = this.r - CFG.fallThresh;
-      // Quadratic speed scaling — big/heavy drops reach much higher top speeds
-      const vMax = Math.min(CFG.maxSpeed, Math.max(1.5, excess * excess * 0.16 + excess * 0.7));
+      // Quadratic speed scaling — big/heavy drops reach much higher top speeds.
+      // Scaled by gStrength: on a tilted screen runs are slower; laid flat they
+      // stop (vMax→~0 clamps any residual motion to a halt).
+      const vMax = Math.min(CFG.maxSpeed, Math.max(1.5, excess * excess * 0.16 + excess * 0.7))
+                 * Math.max(0.04, gStrength);
 
       // Stick-slip: larger drops have much less sticking (hydrophobic surface)
       this.slipPhase = (this.slipPhase + dt) % this.slipPeriod;
@@ -862,7 +911,7 @@ class Droplet {
       // ANY GRAV direction — only the live accelerometer feed remains to add.
       let vAlong = this.vx * GRAV.x + this.vy * GRAV.y;
       const vpx = this.vx - vAlong * GRAV.x, vpy = this.vy - vAlong * GRAV.y;
-      vAlong = vAlong * drag + CFG.gravity * gravMul * massMul * dt;
+      vAlong = vAlong * drag + CFG.gravity * gStrength * gravMul * massMul * dt;
       if (vAlong > vMax) vAlong = vMax;
       this.vx = vpx + vAlong * GRAV.x;
       this.vy = vpy + vAlong * GRAV.y;
@@ -910,6 +959,11 @@ class Droplet {
         if (this.rivulet.pts.length > 20 && Math.random() < 0.006 * dt)
           this.rivulet.sever();
       }
+
+      // Settle: if gravity is too weak to keep it running (phone near-flat) and
+      // it has essentially stopped, it becomes a static drop again so it can
+      // pool and merge with its neighbours instead of hanging mid-screen.
+      if (gStrength < 0.14 && speed < 0.4) { this.falling = false; this.rivulet = null; }
 
       // Despawn once fully past the downstream screen edge (along gravity)
       if ((GRAV.y > 0 && this.y - this.r > H) || (GRAV.y < 0 && this.y + this.r < 0) ||
@@ -1267,6 +1321,32 @@ document.getElementById('spawnSlider').addEventListener('input', e => {
   CFG.spawnProb = spawnProbs[v];
   document.getElementById('spawnVal').textContent = spawnLabels[v];
 });
+
+// Tilt toggle: drive gravity from the device accelerometer (needs a user
+// gesture + permission on iOS). Tilt the phone to steer the flow; lay it flat
+// and the drops stop running and pool.
+(() => {
+  const row = document.createElement('div');
+  row.className = 'srow';
+  const b = document.createElement('button');
+  b.id = 'tiltBtn';
+  b.textContent = '📱 傾きで流す：OFF';
+  b.style.cssText =
+    'width:100%;padding:7px 0;border-radius:8px;background:rgba(255,255,255,0.10);'
+    + 'border:1px solid rgba(255,255,255,0.20);color:#ddeef8;'
+    + 'font:13px system-ui,sans-serif;cursor:pointer';
+  b.addEventListener('click', async () => {
+    if (!tiltOn) {
+      const ok = await enableTilt();
+      b.textContent = ok ? '📱 傾きで流す：ON' : '📱 傾き非対応/不許可';
+    } else {
+      disableTilt();
+      b.textContent = '📱 傾きで流す：OFF';
+    }
+  });
+  row.appendChild(b);
+  settingsPanel.appendChild(row);
+})();
 
 // Debug-only: cycle test backgrounds (normal → stripes → checker → white)
 if (DEBUG) {
