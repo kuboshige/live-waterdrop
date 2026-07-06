@@ -79,7 +79,7 @@ input[type=range]{width:100%;cursor:pointer;accent-color:#5aaed4}
 
 // Bump this every deploy so it's obvious which build is actually loaded
 // (open ⚙ to see it, or the console). Helps catch stale browser caching.
-const BUILD = '2026-07-06 · mist-ghost-fix+momentum';
+const BUILD = '2026-07-06b · sw-nocache-fix+refresh-btn';
 console.log('Rain on Glass — build:', BUILD);
 
 // Network-first service worker: always loads the freshest deploy when online,
@@ -1183,11 +1183,41 @@ const settingsBtn   = document.getElementById('settingsBtn');
 const settingsPanel = document.getElementById('settingsPanel');
 let settingsTimer   = null;
 
-// Small build tag at the bottom of the settings panel (verify fresh load)
+// "Update" button + build tag at the bottom of the settings panel.
+// The button wipes every cache and the service worker, then reloads from the
+// network — a guaranteed one-tap escape from any stale-cache situation.
 (() => {
+  const row = document.createElement('div');
+  row.className = 'srow';
+  row.style.marginTop = '4px';
+  const btn = document.createElement('button');
+  btn.id = 'refreshBtn';
+  btn.textContent = '🔄 最新に更新（キャッシュ削除）';
+  btn.style.cssText =
+    'width:100%;padding:7px 0;border-radius:8px;background:rgba(90,174,212,0.18);'
+    + 'border:1px solid rgba(120,200,235,0.35);color:#dff;'
+    + 'font:12px system-ui,sans-serif;cursor:pointer';
+  btn.addEventListener('click', async () => {
+    btn.textContent = '更新中…';
+    try {
+      if ('serviceWorker' in navigator) {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(regs.map(r => r.unregister()));
+      }
+      if (window.caches) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map(k => caches.delete(k)));
+      }
+    } catch (e) {}
+    // A never-seen query defeats every layer of HTTP/CDN caching too
+    location.replace(location.pathname + '?fresh=' + Date.now());
+  });
+  row.appendChild(btn);
+  settingsPanel.appendChild(row);
+
   const v = document.createElement('div');
   v.textContent = 'build ' + BUILD;
-  v.style.cssText = 'margin-top:12px;font-size:10px;opacity:0.45;text-align:center';
+  v.style.cssText = 'margin-top:10px;font-size:10px;opacity:0.45;text-align:center';
   settingsPanel.appendChild(v);
 })();
 
