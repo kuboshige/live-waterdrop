@@ -79,7 +79,7 @@ input[type=range]{width:100%;cursor:pointer;accent-color:#5aaed4}
 
 // Bump this every deploy so it's obvious which build is actually loaded
 // (open ⚙ to see it, or the console). Helps catch stale browser caching.
-const BUILD = '2026-07-08a · linear-mobility+mass-loss';
+const BUILD = '2026-07-08b · teardrop+thread-collide+grav-tap';
 console.log('Rain on Glass — build:', BUILD);
 
 // Network-first service worker: always loads the freshest deploy when online,
@@ -126,28 +126,8 @@ function updateHud(dt) {
     pf;
 }
 
-// Hydrophobic surface: a running drop leaves NO lasting ridge — only a short,
-// tapered tail directly behind it (max ~2.5r), fading to nothing. The path
-// itself is wiped clean (see the sweep in Droplet.update).
-function drawTail(d) {
-  const vlen = Math.hypot(d.vx, d.vy);
-  if (vlen < 0.001) return;
-  const len = 2.4 * d.r;
-  const ux = -d.vx / vlen, uy = -d.vy / vlen;   // unit vector opposite to motion
-  const ex = d.x + ux * len, ey = d.y + uy * len; // tail tip
-  const nx = -uy, ny = ux;                        // perpendicular
-  const w = d.r * 0.42;                           // half-width at the drop
-  ctx.beginPath();
-  ctx.moveTo(d.x + nx * w, d.y + ny * w);
-  ctx.lineTo(d.x - nx * w, d.y - ny * w);
-  ctx.lineTo(ex, ey);
-  ctx.closePath();
-  const g = ctx.createLinearGradient(d.x, d.y, ex, ey);
-  g.addColorStop(0, bgHasImg ? 'rgba(200,224,242,0.34)' : 'rgba(180,210,230,0.34)');
-  g.addColorStop(1, 'rgba(200,224,242,0)');
-  ctx.fillStyle = g;
-  ctx.fill();
-}
+// (The old drawTail overlay is gone — running drops now grow a REAL tail as
+// part of their teardrop contour, so a separate painted wake would double up.)
 
 // ── Background ────────────────────────────────────────────────────────────────
 // bgCvs always holds a full-screen copy of the current background so that drops
@@ -245,6 +225,7 @@ const CFG = {
   fallThresh:     10,
   mobility:       0.09,  // linear mobility law: v∞ = mobility·(r²·g − fallThresh²)
   maxSpeed:       30,
+  vPearl:         24,    // speed of full tail-cusp formation / satellite shedding
   maxDroplets:    360,
   numStreaks:     16,
   refrMag:        1.65,
@@ -596,6 +577,14 @@ class Rivulet {
     upper.orphan();
   }
   update(dt) {
+    // Bounding box (refreshed each frame) for cheap drop-contact rejection
+    let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
+    for (const p of this.pts) {
+      if (p.x < x0) x0 = p.x; if (p.x > x1) x1 = p.x;
+      if (p.y < y0) y0 = p.y; if (p.y > y1) y1 = p.y;
+    }
+    this.bx0 = x0; this.bx1 = x1; this.by0 = y0; this.by1 = y1;
+
     if (this.draining) {
       // A falling or absorbed bead no longer collects the thread's water
       if (this.bead && (this.bead.dead || this.bead.falling)) this.bead = null;
@@ -604,8 +593,8 @@ class Rivulet {
         const a = this.pts[0], b = this.pts[1];
         const L = Math.hypot(b.x - a.x, b.y - a.y) || 1;
         this.drainAcc -= L;
-        if (Math.random() < 0.35)                 // dots where the thread dried
-          addMist(a.x + (Math.random() - 0.5) * 3, a.y, 0.6 + Math.random());
+        if (Math.random() < 0.7)                  // dots where the thread dried
+          addMist(a.x + (Math.random() - 0.5) * 3, a.y, 0.7 + Math.random() * 1.2);
         if (this.bead) {                          // pour the segment into the bead
           const vol = L * 1.15;                   // thread cross-section fudge
           this.bead.r = Math.cbrt(this.bead.r ** 3 + vol);
@@ -621,8 +610,8 @@ class Rivulet {
     let n = 0;
     while (n < this.pts.length && this.pts[n].ttl <= 0) {
       const p = this.pts[n];
-      if (Math.random() < 0.5)
-        addMist(p.x + (Math.random() - 0.5) * 3, p.y, 0.7 + Math.random() * 1.2);
+      if (Math.random() < 0.85)
+        addMist(p.x + (Math.random() - 0.5) * 3, p.y, 0.8 + Math.random() * 1.4);
       n++;
     }
     if (n > 0) this.pts.splice(0, n);
@@ -855,10 +844,12 @@ class Droplet {
       this.oscFreq  = (Math.PI * 2) / (6 + this.r * 0.25);  // bigger = a bit slower
     }
     o.dead = true;
-    // The merged, larger footprint swallows any mist beads now underneath it
+    // The merged, larger footprint swallows any mist beads now underneath it —
+    // and if it grew into a water thread, it soaks that up too.
     const mv = takeMist(this.x, this.y, this.x, this.y, this.r * 0.9);
     if (mv > 0) this.r = Math.cbrt(this.r * this.r * this.r + mv);
     this.computeShape();
+    checkRivuletContact(this);
   }
 
   update(dt) {
@@ -965,6 +956,14 @@ class Droplet {
         this.r = Math.cbrt(Math.max(8, this.r ** 3 - shed));
       }
 
+      // Pearling: at very high speed the tail cusp pinches off satellite beads
+      if (speed > CFG.vPearl && Math.random() < 0.5 * dt) {
+        const ux = this.vx / speed, uy = this.vy / speed, back = this.r * 2.9;
+        addMist(this.x - ux * back + (Math.random() - 0.5) * 3,
+                this.y - uy * back + (Math.random() - 0.5) * 3,
+                0.9 + Math.random() * 1.2);
+      }
+
       // Re-pin: if the (shrunken or tilt-weakened) drive can no longer beat the
       // pinning force and the drop has stalled, it pins where it is. Restarting
       // is harder than sustaining (contact line relaxes) → pinExtra grows.
@@ -980,6 +979,9 @@ class Droplet {
           this.rivulet = null;
         }
       }
+
+      // Crossing another drop's thread: sever it and soak up the water above
+      checkRivuletContact(this);
 
       // Despawn once fully past the downstream screen edge (along gravity)
       if ((GRAV.y > 0 && this.y - this.r > H) || (GRAV.y < 0 && this.y + this.r < 0) ||
@@ -1015,12 +1017,46 @@ class Droplet {
       return;
     }
 
-    const isEllipse = Math.abs(sx - 1) > 0.02 || Math.abs(sy - 1) > 0.02;
-    const ringPath = () => {
-      ctx.beginPath();
-      if (isEllipse) ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
-      else           ctx.arc(x, y, r, 0, Math.PI * 2);
-    };
+    // Contour: a MOVING drop is not an ellipse — it is circle-fronted with
+    // concave flanks closing into a rear tail that sharpens with speed
+    // (corner → cusp, Podgorski/Le Grand). Two-circle construction: front
+    // circle (body) + rear circle shrunk/offset by s = speed/v_pearl, joined
+    // by inward-bowed quadratics. Oriented along the velocity (tilt-aware).
+    const spd = this.falling ? Math.hypot(this.vx, this.vy) : 0;
+    let ringPath;
+    if (this.falling && spd > 2) {
+      const s   = Math.min(1, spd / CFG.vPearl);
+      const ux  = this.vx / spd, uy = this.vy / spd;
+      const rF  = rMax * 0.98;
+      const rB  = rF * (1 - 0.55 * s);
+      const dd  = rF * (0.35 + 1.45 * s);
+      const c2x = x - ux * dd, c2y = y - uy * dd;
+      const phi = Math.atan2(-uy, -ux);                 // axis: front → rear
+      const al  = Math.acos(Math.min(1, (rF - rB) / dd));
+      const bow = (ax, ay, bx, by) => {                 // inward-bowed flank
+        const mx = (ax + bx) / 2, my = (ay + by) / 2;
+        const t  = (mx - x) * -ux + (my - y) * -uy;     // project onto axis
+        const qx = x - ux * t, qy = y - uy * t;
+        ctx.quadraticCurveTo(mx + (qx - mx) * 0.45, my + (qy - my) * 0.45, bx, by);
+      };
+      ringPath = () => {
+        ctx.beginPath();
+        ctx.arc(x, y, rF, phi + al, phi - al, false);   // front, through leading pole
+        bow(x + rF * Math.cos(phi - al), y + rF * Math.sin(phi - al),
+            c2x + rB * Math.cos(phi - al), c2y + rB * Math.sin(phi - al));
+        ctx.arc(c2x, c2y, rB, phi - al, phi + al, false); // rear, through tail pole
+        bow(c2x + rB * Math.cos(phi + al), c2y + rB * Math.sin(phi + al),
+            x + rF * Math.cos(phi + al), y + rF * Math.sin(phi + al));
+        ctx.closePath();
+      };
+    } else {
+      const isEllipse = Math.abs(sx - 1) > 0.02 || Math.abs(sy - 1) > 0.02;
+      ringPath = () => {
+        ctx.beginPath();
+        if (isEllipse) ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
+        else           ctx.arc(x, y, r, 0, Math.PI * 2);
+      };
+    }
 
     // Contact shadow: the lens steals light from just outside its rim (P1-4)
     if (r >= 10 && bgHasImg) {
@@ -1124,9 +1160,24 @@ function spawnAt(x, y, r) {
   const vol = takeMist(x, y, x, y, r * 0.9);
   if (vol > 0) d.r = Math.cbrt(d.r * d.r * d.r + vol);
   droplets.push(d);
-  // Landing on a running/draining water thread: sever it and soak up the water
-  // above so the drop and thread never just overlap without interacting.
-  for (const rv of rivulets) if (rv.absorbDrop(d)) break;
+  checkRivuletContact(d);
+}
+
+// Any drop touching a water thread interacts with it: the thread is severed at
+// the contact point and the water above drains into the drop (absorbDrop).
+// Covers every way contact can arise: a drop spawning on a thread, a drop
+// GROWING into one, a tap-nudged drop sliding onto one, and a runner crossing
+// another runner's thread. Skips the drop's own thread / drain relationships.
+function checkRivuletContact(d) {
+  const m = d.r + 4;
+  for (const rv of rivulets) {
+    if (rv === d.rivulet || rv.owner === d || rv.bead === d) continue;
+    if (rv.bx1 === undefined ||
+        d.x < rv.bx0 - m || d.x > rv.bx1 + m ||
+        d.y < rv.by0 - m || d.y > rv.by1 + m) continue;
+    if (rv.absorbDrop(d)) return true;
+  }
+  return false;
 }
 
 function randomSpawn() {
@@ -1241,11 +1292,6 @@ function frame(ts) {
   if (!powerSave) for (const s of streaks) { s.update(); s.draw(); }
 
   for (const rv of rivulets) rv.draw();
-
-  // Short tails behind running drops (drawn before the drops themselves).
-  // Drops with a live rivulet get their tail from the neck flare instead.
-  for (const d of droplets)
-    if (d.falling && d.vy > CFG.depositSpeedMin && !d.rivulet) drawTail(d);
 
   t = performance.now();
   for (const d of droplets) if (!d.falling) d.draw();
@@ -1416,19 +1462,24 @@ function onPointer(e) {
     const px = (p.clientX - rect.left) * scx;
     const py = (p.clientY - rect.top)  * scy;
 
-    // Tap vibration: near-threshold drops nudge downward — and swallow any
-    // mist beads they slide onto (they visibly land on them, so they merge)
+    // Tap vibration: near-threshold drops slip ALONG GRAVITY (accelerometer
+    // direction), scaled by size and by the in-plane gravity strength — on a
+    // flat phone a tap barely moves them; tilted, they slip toward the tilt.
+    // They swallow any mist beads or threads they slide onto.
     const vibrThresh = CFG.fallThresh * 0.72;
     for (const d of droplets) {
       if (d.falling || d.r < vibrThresh) continue;
       const ratio = (d.r - vibrThresh) / (CFG.fallThresh - vibrThresh + d.pinExtra);
-      const oldY = d.y;
-      d.y    += ratio * d.r * 0.50;
+      const shift = ratio * d.r * 0.50 * Math.max(0.1, gStrength);
+      const oldX = d.x, oldY = d.y;
+      d.x    += GRAV.x * shift;
+      d.y    += GRAV.y * shift;
       d.bump  = Math.max(d.bump, 0.07 + ratio * 0.09);
       d.vibTimer = 8;
-      const vol = takeMist(d.x, oldY, d.x, d.y, d.r * 0.9);
+      const vol = takeMist(oldX, oldY, d.x, d.y, d.r * 0.9);
       if (vol > 0) d.r = Math.cbrt(d.r * d.r * d.r + vol);
       d.computeShape();
+      checkRivuletContact(d);
     }
 
     // Spawn drops at tap
